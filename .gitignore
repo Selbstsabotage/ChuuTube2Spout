@@ -1,0 +1,58 @@
+.venv/
+__pycache__/
+*.pyc
+mpv-2.dll
+libmpv-2.dll
+deno.exe
+cache/
+settings.txt
+
+# Console logs. Redacted on the way in, but they are still a record of what was
+# played and when, and they belong to the machine rather than the project.
+logs/
+
+# Never, wherever it ends up: CACHE_DIR is user-overridable, so `cache/` alone
+# is not enough to guarantee a cookie jar stays out of a commit.
+cookies.txt
+cookies*.txt
+*.sqlite
+*.sqlite-wal
+bgutil-server/
+bgutil-pot.exe
+build/
+dist/
+*.spec
+
+# Licence TEXTS for a binary release are per-build and get filled in by the
+# maintainer; the README explaining what goes there is tracked.
+licenses/*.txt
+
+# Working notes, deliberately not published (decided 18 Sep 2026). Candid about
+# what is deferred, what is known broken and what was rejected - useful to
+# whoever maintains this, not something to hand strangers. If it ever does go
+# public, delete this line rather than sanitising the file: a half-honest
+# roadmap is worse than no roadmap.
+ROADMAP.md
+
+# Downloads and builds that must never be committed, wherever they end up:
+# the runtime setup fetches (deno, libmpv, 7zr, the token generator) and the
+# release zip. Nothing in this repository is a binary.
+*.exe
+*.dll
+*.zip
+*.7z
+
+# Old copies, and files moved aside for deletion.
+*.o
+*.bak
+_to_delete/
+
+# Working notes, like ROADMAP.md.
+HANDOFF.md
+
+# Editor and Windows clutter.
+.vscode/
+.idea/
+.pytest_cache/
+Thumbs.db
+desktop.ini

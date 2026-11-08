@@ -1,0 +1,261 @@
+# ChuuTube2Spout settings
+#
+# A line that starts with # is off. Three lines are on: the output size under
+# "Most used". Every other setting is at its default.
+#
+# To change a setting:
+# 1. Remove the # at the start of its line.
+# 2. Change the value. No quotes.
+# 3. Save this file and restart the app.
+# To turn a setting off again, put a # in front of it.
+#
+# The app reads this file, settings.txt, from its own folder. When you update
+# to a new release, copy this file into the new folder. If a setting seems to
+# have no effect, run doctor.bat: it shows which file it read.
+#
+# The value on a line that is off is an example. "Default" is the value the
+# app uses while the line is off. The most-used settings come first; the rest
+# are rarely needed.
+
+
+# === Most used ================================================================
+
+# --- Output size (on) ---
+# Both senders always send 1920 x 1080 pixels. A clip of another shape, for
+# example 4:3, is scaled to fit and keeps its shape. The bars beside or above
+# it are transparent, so Resolume shows the layers beneath them.
+#
+# Keep one fixed size for Resolume: Resolume fits a clip to the layer only
+# once. If the size changes with every clip, a 16:9 clip that follows a 4:3
+# clip is squashed.
+#
+# Set the size to your Resolume composition. For black bars, set
+# SENDER_BACKGROUND=black, or a colour such as #101018. To send each clip at
+# its own size instead, put a # in front of all three lines.
+SENDER_WIDTH=1920
+SENDER_HEIGHT=1080
+SENDER_BACKGROUND=transparent
+
+# --- Signing in to YouTube ---
+# Use your YouTube login from a browser. Needed for age-restricted videos and
+# helps when YouTube blocks downloads. Default: off.
+#   waterfox, librewolf, floorp, zen, firefox   can stay open
+#   chrome, edge, brave, vivaldi, opera         close the browser first
+#   firefox:C:\path\to\profile                  a specific profile
+#COOKIES_FROM_BROWSER=firefox
+
+# --- Window size at start ---
+# Default: the size the window had when you closed it, or 1320 px wide the
+# first time. The height always follows, so the previews stay 16:9. The
+# window never opens larger than the screen or smaller than its controls.
+#
+# A fixed width in pixels, every start. Overrides WINDOW_SCALE.
+# 1320 is the default size: use it to go back to that.
+#WINDOW_WIDTH=1600
+#
+# A multiple of the default size (1 = 1320 px, 1.5 = 1980 px), or max to fill
+# the screen. Default: 1.
+#WINDOW_SCALE=max
+
+# --- Empty slots ---
+# What a slot without a video sends to Resolume: before the first clip, after
+# Clear, and while a failed download is retried.
+#   1  transparent: Resolume shows the layers beneath it (default)
+#   0  black
+#EMPTY_TRANSPARENT=0
+#
+# How the preview shows a transparent empty slot.
+#   1  dark checkerboard (default)
+#   0  black
+#PREVIEW_GRID=0
+
+# --- How long downloaded clips are kept ---
+# Downloaded clips stay in the cache\ folder, so loading one again is
+# instant. Clips older than this many hours are deleted when the app starts
+# and after each download. 0: no age limit. Default: 24.
+#CACHE_MAX_AGE_H=72
+
+
+# === Spout output =============================================================
+
+# Sender names in Resolume. Default: ChuuTube2Spout-A and ChuuTube2Spout-B.
+#SENDER_A=yt2spout-A
+#SENDER_B=yt2spout-B
+
+# The fixed output size and the colour of its bars are under "Most used".
+#
+# With the fixed size: a clip with a different shape, for example 4:3.
+#   fit      scale to fit, with bars (default)
+#   fill     scale to cover, crop the edges
+#   stretch  distort to fill
+#SENDER_FIT=fill
+#
+# Without the fixed size, each clip is sent at its own resolution. Then this
+# is the largest size a clip is sent at: a larger clip is scaled down and
+# keeps its shape, a smaller one is sent as it is. Either can be set alone.
+# Default: no limit.
+#SENDER_MAX_WIDTH=1920
+#SENDER_MAX_HEIGHT=1080
+
+# Both senders appear in Resolume as soon as the app starts. 0: a sender
+# appears only once its slot has played a clip. Default: 1.
+#IDLE_SENDERS=0
+
+
+# === Playback =================================================================
+
+# Download the audio track too. Shows a speaker button in each slot; only one
+# slot plays audio at a time. Default: 0.
+#FETCH_AUDIO=1
+
+# Loop the clip. 0: stop at the end. Default: 1.
+#LOOP=0
+
+# Hardware video decoding. Set to no if the picture is black or the app
+# crashes when a clip loads. Default: auto-safe.
+#HWDEC=no
+
+# Picture upside down?
+#PREVIEW_FLIP=0     # in the preview (default 1)
+#SPOUT_INVERT=1     # in Resolume (default 0)
+
+
+# === Clip cache ===============================================================
+# Downloaded clips are kept in the cache\ folder next to the app, so a clip
+# loads instantly the next time. A 1080p clip is about 70 MB.
+
+# Starting state of the "Clear cache on exit" checkbox. After the first start,
+# the checkbox remembers its own state. Default: 0.
+#CLEAR_CACHE_ON_EXIT=1
+
+# Size limit of the folder in GB. Over it, the least recently used clips are
+# deleted, never one that is playing. 0: no size limit. Default: 10.
+#CACHE_MAX_GB=25
+
+# A new clip is safe from the size limit for this many minutes. Default: 30.
+#CACHE_MIN_AGE_MIN=60
+
+# Another folder for the cache. Default: cache next to the app.
+#CACHE=D:\VJ\clip-cache
+
+
+# === Preview window ===========================================================
+
+# Redraws per second of the preview. Spout always gets every frame. Lower it
+# only if the buttons feel slow; 30 makes 24 fps clips judder. Default: 60.
+#PREVIEW_FPS=30
+
+# Shape of the preview cells, used at start and when you press F.
+# Default: 1.7778 (16:9). 4:3 is 1.3333.
+#PREVIEW_ASPECT=1.3333
+
+# If moving the window leaves a smeared trail: pause the preview while the
+# window moves, until this many ms after the last move. Spout drops to about
+# 30 fps meanwhile. Default: 0 (off).
+#DRAG_SETTLE_MS=220
+
+# Render interval in ms while the window moves, with DRAG_SETTLE_MS on.
+# Default: 32.
+#DRAG_TICK_MS=64
+
+
+# === Advanced: loading ========================================================
+
+# How a clip is fetched.
+#   download  download the whole clip, then play it (default)
+#   hybrid    play the stream while downloading. Does not work for YouTube
+#             yet: it falls back to a normal download.
+#   stream    never download. For direct media links and local files.
+#MODE=hybrid
+
+# Start downloading as soon as a link is in the field, before Load is
+# pressed. Default: 1.
+#PREFETCH=0
+
+# Wait this many ms after typing stops before that download starts. Paste
+# does not wait. Default: 900.
+#PREFETCH_DEBOUNCE_MS=1500
+
+# Start playing before the download has finished. When it finishes, the clip
+# re-opens at the same point, which can stutter once. Default: 1.
+#PARTIAL_PLAY=0
+
+# For PARTIAL_PLAY: start once this many MB have arrived (default 4) and the
+# download has run for this many seconds (default 5). Raise the seconds if
+# you see the stutter on a fast connection.
+#PARTIAL_START_MB=8
+#PARTIAL_AFTER_S=10
+
+# Remember what was downloaded for a link and quality, so loading it again is
+# instant. Default: 1.
+#CACHE_MANIFEST=0
+
+# Keep YouTube's video description for this many minutes, so another quality
+# of the same video loads 4 s to 8 s faster. It contains a PO token and your
+# IP address. Default: on, 45 minutes.
+#INFO_CACHE=0
+#INFO_CACHE_MIN=20
+
+# Download video and audio in one run. Only matters with FETCH_AUDIO=1.
+# Default: 1.
+#SINGLE_PASS_AUDIO=0
+
+
+# === Advanced: YouTube ========================================================
+
+# Preferred video codecs, best first. Default: avc1,h264,vp9,vp09,av01.
+#CODEC_PREFERENCE=vp9,avc1,h264
+
+# YouTube clients to try, in this order. Keep it short: every extra client
+# costs 4 s to 12 s and counts against YouTube's rate limit.
+# Default: default,mweb,web_safari,tv.
+#CLIENT_CHAIN=default,mweb
+
+# Use only this one client. check.bat shows which one works.
+#PLAYER_CLIENT=mweb
+
+# Get PO tokens from the running token server, not by starting a script per
+# request. 0: always use the script. Default: 1.
+#TOKEN_SERVER=0
+
+# Download in pieces of this size. Large files fail without it. Default: 10M.
+#HTTP_CHUNK_SIZE=20M
+
+# yt-dlp downloads its YouTube challenge solver from GitHub. Leave the value
+# empty to turn that off; you then get 360p at most. See SECURITY.md.
+# Default: ejs:github.
+#REMOTE_COMPONENTS=
+
+# --- Cookies, with COOKIES_FROM_BROWSER ---
+# 0: let yt-dlp read the browser directly. Slower, and the browser must be
+# closed. Default: 1.
+#COOKIE_EXPORT=0
+
+# Minutes before the cookies are read from the browser again. Default: 60.
+#COOKIE_MAX_AGE_MIN=30
+
+# Which cookies are used. Default: youtube.com,googlevideo.com.
+# Never add google.com: it also takes your Google account login (Gmail, Drive).
+# yt-dlp does not need it.
+#COOKIE_DOMAINS=youtube.com,googlevideo.com
+
+
+# === Advanced: logs and diagnostics ===========================================
+# Each run writes a log to the logs\ folder next to the app. IP addresses,
+# tokens and signed links are removed from it.
+
+#LOG_TO_FILE=0           # no log files (default 1)
+#LOG_KEEP=30             # number of logs kept (default 10)
+#LOG_DIR=D:\logs\chuutube
+#YTDLP_VERBOSE=0         # less yt-dlp detail (default 1)
+#POT_VERBOSE=0           # less token generator detail (default 1)
+#MPV_LOGLEVEL=warn       # default: info
+
+# Write render timings to the log every N seconds. For reporting stutter or a
+# slow preview. A gap longer than one frame of the clip is a frame that reached
+# Resolume late. Turn it off afterwards: it fills the log. Default: 0 (off).
+#PERF_LOG_S=5
+
+# For testing only. Leave these off.
+#DRAG_PAUSE_RENDER=1           # stop rendering, Spout too, while dragging
+#MPV_BLOCK_FOR_TARGET_TIME=1   # old frame pacing: slots slow each other down

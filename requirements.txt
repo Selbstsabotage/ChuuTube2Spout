@@ -1,0 +1,29 @@
+# Core UI + OpenGL
+PySide6>=6.6,<7
+PyOpenGL>=3.1.7
+# PyOpenGL falls back to slow pure-Python array handling without this, and
+# prints a warning on every start.
+numpy>=1.24
+
+# libmpv binding (needs mpv-2.dll next to the app on Windows - see setup.ps1)
+python-mpv>=1.0.6
+
+# YouTube extraction and downloading. [default] pulls yt-dlp's own recommended
+# extras: certifi, brotli, websockets, requests, pycryptodomex, mutagen.
+yt-dlp[default]>=2024.1.1
+
+# Browser impersonation. YouTube fingerprints TLS; without this yt-dlp can only
+# present a plain urllib handshake, which is one more way to look like a bot.
+curl_cffi>=0.7
+
+# Proof-of-origin token plugin. Without a PO token YouTube serves the first few
+# MB of a video and answers 403 to the rest. setup.ps1 fetches the token
+# generator's source for exactly this version and checks it against
+# checksums.txt, so the two move together: change this pin only alongside a
+# new bgutil-ytdlp-pot-provider-<version>.zip line there. Unpinned, a fresh
+# venv took 2.0.2 while checksums.txt only knew 2.0.0, and the generator was
+# downloaded unverified.
+bgutil-ytdlp-pot-provider==2.0.0
+
+# Spout2 GPU texture sharing (Windows only)
+SpoutGL>=0.0.4 ; sys_platform == "win32"

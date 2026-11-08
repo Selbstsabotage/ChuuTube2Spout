@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security issue
+    url: https://github.com/Selbstsabotage/ChuuTube2Spout/blob/main/SECURITY.md
+    about: Please do not file exploitable bugs publicly - see SECURITY.md.

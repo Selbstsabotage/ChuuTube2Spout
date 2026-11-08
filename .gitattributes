@@ -1,0 +1,4 @@
+# Keep every text file exactly as it is in the repository: LF line endings,
+# also on Windows with core.autocrlf=true. That is how the project has always
+# been kept, and the batch files and PowerShell scripts work with it.
+* text=auto eol=lf
