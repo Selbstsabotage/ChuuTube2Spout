@@ -2,11 +2,13 @@
 
 ChuuTube2Spout plays YouTube videos and sends them to **Spout**, so that
 Resolume Arena and other Spout-capable VJ software can use them as live
-sources. Inspired by*yt2spout*.
+sources. Inspired by *yt2spout*.
 
 - Two slots, A and B, play at the same time. Each has its own Spout sender.
 - Clips are downloaded before they play, so they never buffer mid-set.
 - It runs on Windows. It is free software under the GPL (see [Licence](#licence)).
+
+Disclaimer: Contains AI generated code. Not affiliated with YouTube or Google.
 
 ## Contents
 
