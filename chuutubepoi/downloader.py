@@ -9,7 +9,7 @@ faster. yt-dlp copes by re-extracting and resuming, so it does the fetching.
 
 It is run as a **subprocess**, not through its Python API, deliberately:
 
-* a subprocess inherits PATH, so it finds the same deno, the same plugins and
+* a subprocess inherits PATH, so it finds the same Node, the same plugins and
   the same cookies as the copy you ran by hand;
 * it is passed --ignore-config, so your personal yt-dlp config file cannot
   change what the app does behind its back. That reverses an earlier decision:
@@ -41,7 +41,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -51,7 +50,7 @@ from dataclasses import dataclass
 from typing import NamedTuple
 from pathlib import Path
 
-from .bootstrap import ytdlp_command
+from .bootstrap import find_node, ytdlp_command
 from .config import (AUTO_CLIENT, CACHE_DIR, CACHE_MANIFEST, CACHE_MAX_GB, CACHE_MIN_AGE_MIN,
                      CLIENT_CHAIN, COOKIE_DOMAINS,
                      COOKIE_EXPORT, COOKIE_MAX_AGE_MIN, COOKIES_FROM_BROWSER,
@@ -73,6 +72,9 @@ PRINT_TEMPLATE = ("after_move:%(filepath)s" + FIELD_SEP + "%(height)s"
 
 MANIFEST_VERSION = 2
 _NO_FORMAT = re.compile(r"requested format is not available", re.I)
+# yt-dlp's answer for text that is not a link it can use: no extractor takes
+# it ("Unsupported URL") or it is not a URL at all ("'x' is not a valid URL").
+_NOT_A_LINK = re.compile(r"is not a valid URL|Unsupported URL:", re.I)
 
 # YouTube's answer to a request whose headers are too big. In practice
 # that means the Cookie header, so it fails identically for every client -
@@ -211,13 +213,20 @@ def video_format(max_height: int | None) -> str:
 
 
 def js_runtime_arg() -> list[str]:
-    """Point yt-dlp at deno explicitly if we can find it.
+    """Point yt-dlp at Node.js explicitly, and at nothing else.
 
-    It looks on PATH by itself, but being explicit removes a whole category of
-    "is it actually seeing it?" from the diagnosis.
+    yt-dlp enables only deno by default, so Node has to be named. And deno
+    outranks Node when both are enabled - yt-dlp's manual: "--no-js-runtimes
+    needs to be passed before enabling other runtimes". Without it, a deno.exe
+    left in the folder from before 1.1 would quietly stay in charge.
+
+    The path also reaches the token plugin: its Node provider reads the
+    location from the same option before it looks on PATH.
     """
-    deno = shutil.which("deno")
-    return ["--js-runtimes", f"deno:{deno}"] if deno else []
+    node = find_node()
+    if not node:
+        return []
+    return ["--no-js-runtimes", "--js-runtimes", f"node:{node}"]
 
 
 def parse_progress(line: str) -> str | None:
@@ -389,13 +398,18 @@ def _command(ytdlp, url: str, fmt: str, cache: Path,
 
 
 def _info_command(ytdlp, info: Path, fmt: str, cache: Path,
-                  print_file: Path) -> list[str]:
+                  print_file: Path, extra=()) -> list[str]:
     """Download from a cached description instead of extracting again.
 
     Everything to do with reaching YouTube is gone: no client, no cookies, no
     PO token, no JS challenge. The formats were listed when the description was
     written, so -f picks from those - which is the whole trick behind changing
     quality without paying for a second extraction.
+
+    `extra` is what the attempt adds - in practice --no-continue, for the
+    retry "from the start". Tester, 1.0.11: it was dropped here, so that retry
+    resumed the same finished file into the same HTTP 416, and only the full
+    extraction after it got the clip.
     """
     prefix = [ytdlp] if isinstance(ytdlp, str) else list(ytdlp)
     cmd = [
@@ -414,6 +428,7 @@ def _info_command(ytdlp, info: Path, fmt: str, cache: Path,
         cmd += ["--http-chunk-size", HTTP_CHUNK_SIZE]
     if YTDLP_VERBOSE:
         cmd.append("-v")
+    cmd += list(extra)
     cmd += ["--load-info-json", str(info)]
     return cmd
 
@@ -450,6 +465,26 @@ def cookie_args() -> list[str]:
     return []
 
 
+def without_js_flags(extra: list[str]) -> list[str]:
+    """`extra` minus --no-js-runtimes and --js-runtimes VALUE.
+
+    For an older yt-dlp that stops at the first option it does not know.
+    """
+    out: list[str] = []
+    skip = False
+    for arg in extra:
+        if skip:
+            skip = False
+            continue
+        if arg == "--no-js-runtimes":
+            continue
+        if arg == "--js-runtimes":
+            skip = True
+            continue
+        out.append(arg)
+    return out
+
+
 def client_arg(client: str | None) -> list[str]:
     return ["--extractor-args", f"youtube:player_client={client}"] if client else []
 
@@ -475,9 +510,12 @@ def _strategies() -> list[tuple[str, list[str]]]:
             clients.append(None)   # always leave yt-dlp's own choice as a floor
 
     out = [(c or "default", js + client_arg(c)) for c in clients]
-    if js:
-        # An older yt-dlp may not know --js-runtimes at all.
-        out.append(("no js flag", client_arg(clients[0])))
+    # No "no js flag" entry any more (1.0.4). It was always in the chain, for
+    # an older yt-dlp that does not know --js-runtimes - so after any four
+    # failures it ran yt-dlp with its defaults, which means deno if one is
+    # installed. The tester's Mac had one: "JS runtimes: deno-2.9.8". The
+    # download loop now drops the flags only when yt-dlp has said it does not
+    # know them (without_js_flags).
     # Last resort: ignore any partial file and start clean.
     out.append(("fresh start", js + client_arg(clients[0]) + ["--no-continue"]))
     return out
@@ -611,7 +649,7 @@ def _run(ytdlp: str, url: str, fmt: str, cache: Path, progress,
             if progress:
                 progress(f"fetching ({label_extra})...")
             print(f"[chuutube] trying: {label_extra}", file=sys.stderr)
-            cmd = (_info_command(ytdlp, info, fmt, cache, print_file)
+            cmd = (_info_command(ytdlp, info, fmt, cache, print_file, extra)
                    if info is not None
                    else _command(ytdlp, url, fmt, cache, print_file, extra,
                                  cookies=attempt.cookies))
@@ -623,6 +661,7 @@ def _run(ytdlp: str, url: str, fmt: str, cache: Path, progress,
 
             tail = []
             unknown_option = False
+            not_a_link = False
             no_format = False
             too_large = False
             bot_check = False
@@ -664,6 +703,8 @@ def _run(ytdlp: str, url: str, fmt: str, cache: Path, progress,
                 del tail[:-40]
                 if "no such option" in line.lower() and "js-runtime" in line.lower():
                     unknown_option = True
+                if _NOT_A_LINK.search(line):
+                    not_a_link = True
                 if _NO_FORMAT.search(line):
                     no_format = True
                 if _TOO_LARGE.search(line):
@@ -744,8 +785,23 @@ def _run(ytdlp: str, url: str, fmt: str, cache: Path, progress,
             except Exception:
                 pass
 
-            if unknown_option and extra:
-                continue             # retry without the flag
+            if unknown_option and without_js_flags(extra) != list(extra):
+                # This yt-dlp predates --js-runtimes. Every remaining attempt
+                # carries the flag and would stop on it the same way, so all
+                # of them, this one first, go again without it.
+                print("[chuutube] this yt-dlp does not know --js-runtimes - "
+                      "trying again without it. Update yt-dlp: without the "
+                      "flag it cannot be told to use Node.js.",
+                      file=sys.stderr)
+                attempts[index + 1:] = [
+                    a._replace(label=f"{a.label} (no js flag)",
+                               extra=without_js_flags(a.extra))
+                    for a in attempts[index:]]
+                continue
+            if not_a_link:
+                # Not a link yt-dlp can use. Every client gets the same
+                # answer; the tester's log walked all six for "ur mom gae".
+                raise DownloadError(_explain(tail, proc.returncode))
             if proc.returncode == 0:
                 break
             if too_large and attempt.cookies:

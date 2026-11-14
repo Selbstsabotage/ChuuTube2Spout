@@ -12,10 +12,15 @@ answers 403 to everything after it. That is not a bug in the player, the
 headers, the ranges or the IP - all of which were investigated at length - it
 is a deliberate gate, and the token is the key to it.
 
-The token generator is a single Rust executable with no Node.js or other
-runtime behind it, which matters because this app is meant to be portable. We
-run it as a child process for the lifetime of the app and point yt-dlp at it;
-if someone already has one running on the port, we use theirs instead.
+The generator is the plugin's own TypeScript, from the same release as the
+plugin, compiled once into `build/` and run by Node.js. We run its server as a
+child process for the lifetime of the app and point yt-dlp at it; if someone
+already has one running on the port, we use theirs instead. Script mode - the
+plugin starting Node once per token - is the fallback, and the separate Rust
+executable (bgutil-pot.exe) a spare behind that.
+
+Node replaced deno in 1.1. deno ran the TypeScript as it was; Node needs it
+built first (`npm ci`, then `tsc`), which is what install_script_deps does.
 """
 
 from __future__ import annotations
@@ -31,14 +36,15 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from .bootstrap import project_root
+from .bootstrap import find_node, node_major, npm_cli, project_root
 from .config import POT_VERBOSE, TOKEN_SERVER
 from .redact import scrub
 
 DEFAULT_PORT = 4416
 START_TIMEOUT = 45.0
-# How long a download may wait for the one-off `deno install` to finish. The
-# alternative is fetching that clip without a token, i.e. at 360p.
+# How long a download may wait for the one-off build of the generator (npm ci,
+# then tsc) to finish. The alternative is fetching that clip without a token,
+# i.e. at 360p.
 SCRIPT_PREP_TIMEOUT = 900.0
 EXE_NAMES = ("bgutil-pot.exe", "bgutil-pot",
              "bgutil-pot-windows-x86_64.exe")
@@ -96,7 +102,10 @@ GENERATOR_NAMES = ("main.ts", "generate_once.ts")
 
 
 def generator_script(server: Path | str) -> Path | None:
-    """The generator inside a `server` directory, whichever release wrote it."""
+    """The generator SOURCE inside a `server` directory, whichever release wrote it.
+
+    Says that a tree is there. Whether it can run is built_server/built_script.
+    """
     src = Path(server) / "src"
     for name in GENERATOR_NAMES:
         candidate = src / name
@@ -105,15 +114,38 @@ def generator_script(server: Path | str) -> Path | None:
     return None
 
 
+# What Node runs: the TypeScript compiled by tsc into build/ (tsconfig.json's
+# outDir). The names are not ours to choose. The plugin's Node provider runs
+# exactly build/generate_once.js (BgUtilScriptNodePTP._SCRIPT_BASENAME), and
+# the server is main.ts compiled, as in the generator's own Dockerfile.
+BUILD_DIR = "build"
+BUILT_SERVER = "main.js"
+BUILT_SCRIPT = "generate_once.js"
+
+
+def built_server(server: Path | str) -> Path | None:
+    candidate = Path(server) / BUILD_DIR / BUILT_SERVER
+    return candidate if candidate.is_file() else None
+
+
+def built_script(server: Path | str) -> Path | None:
+    candidate = Path(server) / BUILD_DIR / BUILT_SCRIPT
+    return candidate if candidate.is_file() else None
+
+
 # Written into node_modules after a probe has actually run the generator. The
-# folder existing is not evidence: a deno install that dies half way leaves a
+# folder existing is not evidence: an install that dies half way leaves a
 # node_modules behind that cannot resolve.
 READY_MARKER = ".chuutube-ready"
 
-# What deno says when the drive cannot make the links node_modules is built
-# from. Seen on a tester's Y: drive: "failed to create junction '...' to '...':
-# Incorrect function. (os error 1)" - ERROR_INVALID_FUNCTION: the driver behind
-# the drive letter does not implement the request.
+# What an install says when the drive cannot make the links node_modules is
+# built from. Seen with deno on a tester's Y: drive: "failed to create junction
+# '...' to '...': Incorrect function. (os error 1)" - ERROR_INVALID_FUNCTION:
+# the driver behind the drive letter does not implement the request.
+#
+# npm, since 1.1, lays node_modules out as plain folders and files, so this
+# should no longer happen. Kept so that if any drive does refuse, the build
+# still has somewhere else to go.
 #
 # The tester's drive was exFAT, which has no reparse points at all. Keyed on
 # the error rather than on the filesystem anyway: FAT32, most network shares
@@ -133,11 +165,19 @@ def local_server_root() -> Path | None:
     base = os.getenv("LOCALAPPDATA")
     if not base:
         return None
-    return Path(base) / "ChuuTube2Spout" / "bgutil-server"
+    return Path(base) / "ChuuTubePoi" / "bgutil-server"
 
 
 def is_ready(server: Path | str) -> bool:
-    return (Path(server) / "node_modules" / READY_MARKER).is_file()
+    """Probed OK, and built for Node.
+
+    The build half matters on the first start after 1.1: a tree deno had
+    probed still carries the marker, but has no build/ for Node to run. Taken
+    as ready, it would win over every other tree and never start.
+    """
+    return ((Path(server) / "node_modules" / READY_MARKER).is_file()
+            and built_server(server) is not None
+            and built_script(server) is not None)
 
 
 def mark_ready(server: Path | str) -> None:
@@ -146,7 +186,7 @@ def mark_ready(server: Path | str) -> None:
         return
     try:
         (node_modules / READY_MARKER).write_text(
-            "probed OK by ChuuTube2Spout\n", encoding="utf-8")
+            "probed OK by ChuuTubePoi\n", encoding="utf-8")
     except OSError:
         pass                  # read-only, or gone - it will be probed again
 
@@ -178,8 +218,8 @@ def find_script_home() -> str | None:
     """Source tree for the plugin's own script-mode generator, if present.
 
     This is the version-matched option: the plugin and the generator come from
-    the same release, so they cannot disagree about protocol. deno runs the
-    TypeScript directly, so no Node.js is required.
+    the same release, so they cannot disagree about protocol. Node runs it
+    from build/, compiled on this machine.
 
     A tree that has been proven to work wins over one that has not, wherever
     it is. Otherwise a copy relocated to %LOCALAPPDATA% because the app's drive
@@ -222,7 +262,7 @@ def relocate_script_home(script_home: str) -> str | None:
 
 
 def script_server_command(script_home: str) -> list[str] | None:
-    """deno running the generator's own server, or None if this tree has none.
+    """Node running the generator's own server, or None if this tree has none.
 
     2.0.0 merged the one-shot generator and the server into a single main.ts,
     which is what makes this possible: the server is now the same code, from
@@ -232,14 +272,18 @@ def script_server_command(script_home: str) -> list[str] | None:
     compatibility check that exists to stop mismatches.
 
     Only for 2.x trees: 1.3.1's generate_once.ts answers one request and exits.
+    And only once built: Node cannot run the TypeScript source.
     """
     script = generator_script(script_home)
     if script is None or script.name != "main.ts":
         return None
-    deno = shutil.which("deno")
-    if not deno:
+    server = built_server(script_home)
+    if server is None:
         return None
-    return [deno, *script_args(script_home), str(script)]
+    node = find_node()
+    if not node:
+        return None
+    return [node, *server_args(script_home, node_major(node)), str(server)]
 
 
 def find_executable() -> str | None:
@@ -273,7 +317,7 @@ class PotProvider:
         self.port = port
         self._process: Optional[subprocess.Popen] = None
         self._external = False
-        # Which server is answering: "deno" (the generator's own, version-matched
+        # Which server is answering: "node" (the generator's own, version-matched
         # by construction), "exe" (the separate Rust port) or "external"
         # (someone else's, already on the port). compatible() cannot ask a
         # version question of the first one, because there is no gap to check.
@@ -290,7 +334,7 @@ class PotProvider:
 
     @property
     def server_kind(self) -> str | None:
-        """Which server is answering: "deno", "exe", "external", or None.
+        """Which server is answering: "node", "exe", "external", or None.
 
         Public because the diagnostics have to report what the app will
         actually use, and guessing wrong is how a working setup got a red FAIL.
@@ -314,7 +358,7 @@ class PotProvider:
         Not the same question as `running`, and conflating the two put a red
         "no PO token server" warning across the bottom of a window that was
         happily fetching 1080p. In script mode there is no server and never will
-        be: yt-dlp runs the generator itself, per request, via deno. Anything
+        be: yt-dlp runs the generator itself, per request, via Node. Anything
         asking "are we gated?" wants this, not a process check.
         """
         return (self._script_home is not None and self._script_ok is not False
@@ -326,7 +370,7 @@ class PotProvider:
         Pointing yt-dlp at a server the plugin refuses is worse than pointing
         it at nothing: you get a wall of warnings and the same failure.
         """
-        if self._server_kind == "deno":
+        if self._server_kind == "node":
             # Same release as the plugin, out of the same directory. There is
             # no version pair to compare.
             return True
@@ -341,7 +385,7 @@ class PotProvider:
         Only a *verified* script home is advertised. Handing the plugin a
         server_home whose dependencies do not resolve is worse than handing it
         nothing: the plugin reports itself available, yt-dlp asks it for a
-        token, the deno run fails, and the only visible consequence is a 360p
+        token, the Node run fails, and the only visible consequence is a 360p
         download - which is indistinguishable from having no provider at all.
         """
         # Whichever we actually have, server first for the same reason start()
@@ -368,7 +412,7 @@ class PotProvider:
             return True
 
         # The server first, when we have a usable one. It is the same token
-        # either way; the difference is that script mode pays for a deno
+        # either way; the difference is that script mode pays for a Node
         # process on every single request and the server has already paid.
         # _start_server refuses a version-mismatched executable and returns
         # False, so this degrades to script mode rather than to no token.
@@ -380,7 +424,7 @@ class PotProvider:
             if self._preparing or self._script_ok is not None:
                 # Already checked, or a check is running. start() is called
                 # from every window that opens; re-probing each time meant a
-                # fresh deno run - and, on a cold tree, a fresh deno install.
+                # fresh Node run - and, on a cold tree, a fresh build.
                 return True
             self._preparing = True
             self._script_home = script_home
@@ -394,24 +438,38 @@ class PotProvider:
 
         return self._start_server()
 
+    def wait_settled(self, timeout: float = SCRIPT_PREP_TIMEOUT) -> None:
+        """Wait until script mode is checked and the server has had its chance.
+
+        start() returns at once: script mode is checked in the background, and
+        the server is started only after that check passes. Anything that
+        reports what the app uses (the diagnostics) has to wait for both, or it
+        reports the first second - "script mode", on a setup where the server
+        comes up a moment later. Idempotent: if the server is already
+        running, _start_server returns at once.
+        """
+        if self._script_home is None and not self._preparing:
+            return
+        self._prepared.wait(timeout)
+        if self._script_ok and TOKEN_SERVER:
+            self._start_server()
+
     def _prepare_script(self, script_home: str) -> None:
         """Verify script mode really works, repairing it once if it does not.
 
-        A release ships the generator's source but not its `node_modules`:
-        deno lays that tree out as a farm of symlinks into `.deno/`, and both
-        copying and zipping dereference those links, which leaves every package
-        without its own dependencies. The tree has to be built on the machine
-        that will use it - which is a one-off minute, and the same `deno
-        install` that setup.ps1 runs from source.
+        Nothing of the generator is in a release: setup fetches its source,
+        and its `node_modules` and `build/` are made on the machine that will
+        use them - by setup, or here if setup could not finish. A one-off few
+        minutes, and the same npm ci and tsc that setup.ps1 runs.
         """
         ok, detail = script_probe(script_home)
         if not ok:
-            self.status = "preparing the token generator (about a minute)"
+            self.status = "preparing the token generator (a few minutes)"
             print(f"[pot] {self.status}", file=sys.stderr)
             installed, install_detail = install_script_deps(script_home)
             if not installed:
-                print(f"[pot] deno install failed: {install_detail}",
-                      file=sys.stderr)
+                print(f"[pot] building the token generator failed: "
+                      f"{install_detail}", file=sys.stderr)
                 if any(word in install_detail.lower() for word in LINK_FAILURE):
                     moved = self._relocate(script_home)
                     if moved:
@@ -432,7 +490,7 @@ class PotProvider:
         # Do not keep advertising it. _start_server says for itself what it
         # finds: this used to announce "falling back to the standalone token
         # server" on machines that had no standalone server, and then start
-        # the deno one that had just failed, which failed again the same way.
+        # the Node one that had just failed, which failed again the same way.
         self._script_ok = False
         self._script_home = None
         self._preparing = False
@@ -446,14 +504,13 @@ class PotProvider:
         if not target:
             return None
         drive = Path(script_home).drive or "the app's drive"
-        print(f"[pot] {drive} refused to create the junctions deno builds "
-              "node_modules from (\"Incorrect function\") - exFAT and FAT32 "
-              f"drives cannot make them. Building it in {target} instead.",
-              file=sys.stderr)
+        print(f"[pot] {drive} refused to create the links node_modules needs "
+              "(\"Incorrect function\") - exFAT and FAT32 drives cannot make "
+              f"them. Building it in {target} instead.", file=sys.stderr)
         installed, detail = install_script_deps(target)
         if not installed:
-            print(f"[pot] deno install failed there too: {detail}",
-                  file=sys.stderr)
+            print(f"[pot] building the token generator failed there too: "
+                  f"{detail}", file=sys.stderr)
             return None
         return target
 
@@ -489,14 +546,15 @@ class PotProvider:
         script_home = find_script_home()
         kind = "exe"
         command = None
-        # Only a tree a probe has run. An unbuilt one cannot start - "Could not
-        # resolve 'express'" - and trying anyway put a deno error at the top of
-        # every first run's log, which a tester reasonably read as deno being
-        # broken. _prepare_script builds it and then calls back in here.
+        # Only a tree a probe has run. An unbuilt one cannot start - "Cannot
+        # find module 'express'" - and trying anyway (with deno) put an error at
+        # the top of every first run's log, which a tester reasonably read as
+        # the runtime being broken. _prepare_script builds it and then calls
+        # back in here.
         if script_home and is_ready(script_home):
             command = script_server_command(script_home)
             if command is not None:
-                kind = "deno"
+                kind = "node"
                 command += ["--host", BIND_HOST, "--port", str(self.port)]
 
         if command is None:
@@ -517,7 +575,12 @@ class PotProvider:
                     # (or already is), and starts the server when it has.
                     self.status = "token generator not prepared yet"
                     return False
-                if script_home:
+                if script_home and self._script_ok:
+                    # Script mode works; only the server did not start (its
+                    # own exit is logged above). Tokens still come, slower.
+                    self.status = ("script mode issues the tokens - the "
+                                   "token server could not be started")
+                elif script_home:
                     self.status = ("no token generator is running: its "
                                    "dependencies could not be built (see "
                                    "above). Most clips still download; some "
@@ -564,6 +627,9 @@ class PotProvider:
                 self.status = (f"{Path(exe).name} exited "
                                f"(code {proc.returncode}): {detail}")
                 print(f"[pot] {self.status}", file=sys.stderr)
+                if kind == "node" and any(ACCESS_DENIED in line
+                                          for line in self._log):
+                    print(f"[pot] {SANDBOX_REFUSED}", file=sys.stderr)
                 self._process = None
                 self._server_kind = None
                 return False
@@ -631,32 +697,59 @@ def script_cache_dir(script_home: str) -> str:
     return script_home
 
 
-def script_args(script_home: str) -> list[str]:
-    """deno's arguments, matching BgUtilScriptDenoPTP._jsrt_args exactly.
+# Node's permission model refused the server something. The code it prints.
+ACCESS_DENIED = "ERR_ACCESS_DENIED"
+SANDBOX_REFUSED = ("Node's permission model refused the token server "
+                   "something it needs (ERR_ACCESS_DENIED above). Script mode "
+                   "is used instead, which works but runs without that limit. "
+                   "Please report this line.")
 
-    Scoped, not --allow-all: this runs third-party TypeScript. The first version
-    of this granted only node_modules, which is narrower than the plugin - the
-    generator calls existsSync on its cache directory and died on a permission
-    it is normally given. A probe stricter than the real thing reports working
-    setups as broken, which is worse than not probing at all.
+
+# From this Node.js version on, --permission blocks the network too, and
+# --allow-net (a plain switch) grants it. Older versions do not know the flag
+# and refuse to start with it. Seen on K's first 1.1 run with Node 26: "Access
+# to this API has been restricted. Use --allow-net to manage permissions."
+NODE_NET_PERMISSION_MAJOR = 25
+
+
+def server_args(script_home: str, major: int | None = None) -> list[str]:
+    """Node's arguments for the server we start: the permission model, scoped.
+
+    This runs third-party JavaScript. deno ran it with file access limited to
+    node_modules and the cache; Node has no such limit unless asked. So the
+    server may read its own tree (build, node_modules) and read and write the
+    cache, nothing else: no other files, no child processes, no native addons.
+    Network is allowed - minting a token is a network job - with --allow-net
+    on a Node that has it (`major`, 25 or newer; unknown counts as new, since
+    the Node setup installs is).
+
+    Script mode cannot have this. The plugin starts Node itself, with no
+    arguments of ours, so it runs the same code unlimited. That is the
+    fallback, used when the server is not running.
+
+    Paths as separate flags, one each: Node 23 stopped splitting the value on
+    commas, so `--allow-fs-read=a,b` would mean one path called "a,b".
     """
     cache = script_cache_dir(script_home)
-    node_mods = os.path.join(script_home, "node_modules")
-
-    def esc(*parts):
-        return ",".join(p.replace(",", ",,") for p in parts)
-
-    return ["run", "--allow-env", "--allow-net",
-            f"--allow-ffi={esc(node_mods)}",
-            f"--allow-write={esc(cache)}",
-            f"--allow-read={esc(cache, node_mods)}"]
+    home = os.path.abspath(script_home)
+    args = ["--permission",
+            f"--allow-fs-read={home}",
+            f"--allow-fs-read={cache}",
+            f"--allow-fs-write={cache}"]
+    if major is None or major >= NODE_NET_PERMISSION_MAJOR:
+        # Node 26 calls the flag experimental and says so on every start
+        # ("ExperimentalWarning: The flag --allow-net is under experimental
+        # phase", K's log). Harmless, but it reads like a fault in a log a
+        # tester sends in. Only that category is silenced; Node 22+ knows
+        # --disable-warning.
+        args += ["--allow-net", "--disable-warning=ExperimentalWarning"]
+    return args
 
 
 def script_env() -> dict:
     env = dict(os.environ)
-    env["DENO_NO_PROMPT"] = "1"
-    env["DENO_NO_UPDATE_CHECK"] = "1"
     env["FORCE_COLOR"] = "false"
+    env["NO_COLOR"] = "1"
     return env
 
 
@@ -668,63 +761,104 @@ def script_probe(script_home: str) -> tuple[bool, str]:
     could not resolve reported itself ready and quietly served 360p. Checking
     the return code is the entire point.
 
-    Doubles as the warm-up it used to be: deno's first run compiles the
-    TypeScript, which on a cold cache takes longer than yt-dlp's 15 second
-    availability window.
+    Runs exactly what the plugin's own check runs before it will use Node:
+    `node build/generate_once.js --version`. A probe stricter than the real
+    thing reports working setups as broken; a looser one reports broken ones
+    as working.
     """
-    deno = shutil.which("deno")
-    script = generator_script(script_home)
-    if not deno:
-        return False, "deno was not found on PATH"
-    if script is None:
+    node = find_node()
+    if not node:
+        return False, "Node.js was not found (re-run setup)"
+    if generator_script(script_home) is None:
         return False, (f"no generator in {Path(script_home) / 'src'} - "
                        f"expected one of {', '.join(GENERATOR_NAMES)}")
+    script = built_script(script_home)
+    if script is None:
+        return False, (f"not built yet: {BUILD_DIR}/{BUILT_SCRIPT} is missing")
     try:
         os.makedirs(script_cache_dir(script_home), exist_ok=True)
-        # 2.0.0's main.ts is the server CLI and has no --version; asking for
-        # one answers "error: unknown option '--version'", which this then
-        # reported as "script mode is broken" on a setup that was fine.
-        probe_flag = "--help" if script.name == "main.ts" else "--version"
-        done = subprocess.run([deno, *script_args(script_home),
-                               str(script), probe_flag],
+        done = subprocess.run([node, str(script), "--version"],
                               capture_output=True, text=True, env=script_env(),
                               encoding="utf-8", errors="replace", timeout=180,
                               creationflags=getattr(subprocess,
                                                     "CREATE_NO_WINDOW", 0))
     except Exception as exc:
-        return False, f"could not run deno: {exc}"
+        return False, f"could not run Node.js: {exc}"
     if done.returncode == 0:
         return True, (done.stdout or "").strip()
+    return False, _last_lines(done)
+
+
+def _last_lines(done) -> str:
     detail = _ANSI.sub("", (done.stderr or done.stdout or "")).strip()
     last = [line for line in detail.splitlines() if line.strip()][-2:]
-    return False, scrub("; ".join(last) or f"exit status {done.returncode}")
+    return scrub("; ".join(last) or f"exit status {done.returncode}")
+
+
+# npm's own chatter switched off: no update check against the registry, no
+# funding or audit requests, no colour codes in the log.
+NPM_ENV = {"npm_config_update_notifier": "false",
+           "npm_config_fund": "false",
+           "npm_config_audit": "false",
+           "npm_config_color": "false"}
+
+
+def npm_ci_command(node: str, npm: Path | str) -> list[str]:
+    """`npm ci`, exactly as setup.ps1 runs it.
+
+    `ci`, not `install`: it installs what package-lock.json lists, every
+    package checked against the integrity hash recorded there, and stops if
+    the lock and package.json disagree. Nothing is re-resolved on this machine.
+
+    --ignore-scripts: no package's install script runs. That is the same choice
+    deno made (no --allow-scripts). The two packages that ask for scripts are
+    canvas, whose install script fetches a native part, and @swc/core, a
+    development tool. The generator ran without either script under deno for
+    months, so it does not need them.
+    """
+    return [node, str(npm), "ci", "--ignore-scripts", "--no-audit", "--no-fund"]
+
+
+def tsc_command(node: str, script_home: str) -> list[str]:
+    """TypeScript's compiler, from the generator's own node_modules."""
+    tsc = Path(script_home) / "node_modules" / "typescript" / "bin" / "tsc"
+    return [node, str(tsc)]
 
 
 def install_script_deps(script_home: str) -> tuple[bool, str]:
-    """Build the generator's node_modules with deno, in place.
+    """Build the generator in place: `npm ci`, then `tsc` into build/.
 
-    No --allow-scripts. That authorises npm lifecycle scripts for every package
-    in the resolved tree, and the tree is re-resolved on each machine - so one
-    compromised transitive dependency would run as the user. setup.ps1 makes
-    the same call and the same choice; the packages that want scripts here are
-    dev-only.
+    The result is judged by what Node will run, not by exit codes alone: tsc
+    writes its output even when it also reports a type error, and the two
+    built files are what the server and the plugin need.
     """
-    deno = shutil.which("deno")
-    if not deno:
-        return False, "deno was not found on PATH"
+    node = find_node()
+    if not node:
+        return False, "Node.js was not found (re-run setup)"
+    npm = npm_cli(node)
+    if npm is None:
+        return False, f"npm was not found beside {node} (re-run setup)"
+    env = dict(script_env(), **NPM_ENV)
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        done = subprocess.run([deno, "install"], cwd=script_home,
-                              capture_output=True, text=True,
+        done = subprocess.run(npm_ci_command(node, npm), cwd=script_home,
+                              capture_output=True, text=True, env=env,
                               encoding="utf-8", errors="replace", timeout=900,
-                              creationflags=getattr(subprocess,
-                                                    "CREATE_NO_WINDOW", 0))
+                              creationflags=flags)
     except Exception as exc:
-        return False, f"could not run deno install: {exc}"
-    if done.returncode == 0 and (Path(script_home) / "node_modules").is_dir():
+        return False, f"could not run npm: {exc}"
+    if done.returncode != 0:
+        return False, "npm ci: " + _last_lines(done)
+    try:
+        done = subprocess.run(tsc_command(node, script_home), cwd=script_home,
+                              capture_output=True, text=True, env=env,
+                              encoding="utf-8", errors="replace", timeout=300,
+                              creationflags=flags)
+    except Exception as exc:
+        return False, f"could not run tsc: {exc}"
+    if built_server(script_home) and built_script(script_home):
         return True, ""
-    detail = _ANSI.sub("", (done.stderr or done.stdout or "")).strip()
-    last = [line for line in detail.splitlines() if line.strip()][-2:]
-    return False, scrub("; ".join(last) or f"exit status {done.returncode}")
+    return False, "tsc: " + _last_lines(done)
 
 
 _provider = PotProvider()

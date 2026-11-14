@@ -314,6 +314,11 @@ def _flush_once(handle=None) -> bool:
     return True
 
 
+def flush_all() -> None:
+    """Push out what the log and the console still hold. Safe at any time."""
+    _flush_all()
+
+
 def _flush_all() -> None:
     for stream in (sys.stdout, sys.stderr):
         try:

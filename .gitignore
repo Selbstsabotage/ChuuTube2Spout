@@ -4,6 +4,7 @@ __pycache__/
 mpv-2.dll
 libmpv-2.dll
 deno.exe
+node/
 cache/
 settings.txt
 
@@ -21,6 +22,7 @@ bgutil-server/
 bgutil-pot.exe
 build/
 dist/
+build-mac.log
 *.spec
 
 # Licence TEXTS for a binary release are per-build and get filled in by the
@@ -35,7 +37,7 @@ licenses/*.txt
 ROADMAP.md
 
 # Downloads and builds that must never be committed, wherever they end up:
-# the runtime setup fetches (deno, libmpv, 7zr, the token generator) and the
+# the runtime setup fetches (Node.js, libmpv, 7zr, the token generator) and the
 # release zip. Nothing in this repository is a binary.
 *.exe
 *.dll

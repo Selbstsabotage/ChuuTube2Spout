@@ -8,6 +8,8 @@ Behaviour is chosen by the filename it is invoked as:
     old_ytdlp       - rejects --js-runtimes the way an older yt-dlp would
     muxed_ytdlp     - one file that already carries audio
     noaudio_ytdlp   - refuses a multi-format request, succeeds on a single one
+    notalink_ytdlp  - answers like yt-dlp given text that is not a URL
+    oldfailing_ytdlp - rejects --js-runtimes, and fails with 403 without it
 """
 
 import pathlib
@@ -40,10 +42,15 @@ for i, arg in enumerate(argv):
     elif arg == "-f" and i + 1 < len(argv):
         fmt = argv[i + 1]
 
-if "--js-runtimes" in argv and mode == "old_ytdlp":
+if "--js-runtimes" in argv and mode in ("old_ytdlp", "oldfailing_ytdlp"):
     print("Usage: yt-dlp [OPTIONS] URL [URL...]")
     print("yt-dlp: error: no such option: --js-runtimes")
     sys.exit(2)
+
+if mode == "notalink_ytdlp":
+    print("[generic] Extracting URL: ur mom gae")
+    print("ERROR: [generic] 'ur mom gae' is not a valid URL")
+    sys.exit(1)
 
 print("[youtube] Extracting URL: https://example/watch")
 
@@ -56,7 +63,7 @@ if mode == "noaudio_ytdlp" and wants_audio:
 
 print("[download]  50.0% of   1.00MiB at    1.00MiB/s ETA 00:01")
 
-if mode == "failing_ytdlp":
+if mode in ("failing_ytdlp", "oldfailing_ytdlp"):
     print("ERROR: unable to download video data: HTTP Error 403: Forbidden")
     sys.exit(1)
 

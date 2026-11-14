@@ -9,18 +9,24 @@ OpenGL context good enough to render into.
 from __future__ import annotations
 
 import platform
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 from . import APP_NAME, __version__
-from .bootstrap import (find_ytdlp, prepare_native_paths, project_root,
-                        ytdlp_command)
+from .bootstrap import (NODE_MIN_MAJOR, apply_gl_profile, find_node,
+                        find_ytdlp, npm_cli, prepare_native_paths,
+                        project_root, ytdlp_command)
 
 OK = "  ok   "
 BAD = " FAIL  "
 WARN = " warn  "
+
+
+# Parses "v22.23.4" -> 22. One parser, in bootstrap, for the app and this.
+from .bootstrap import parse_node_major as node_major  # noqa: E402
 
 
 def _where(command: list[str]) -> str:
@@ -79,9 +85,32 @@ def run() -> int:
         _line(BAD, "libmpv", str(exc))
         if sys.platform == "win32":
             print("        -> put mpv-2.dll next to the app (setup.ps1 does this)")
+        elif sys.platform == "darwin":
+            print("        -> brew install mpv")
 
-    # --- Spout --------------------------------------------------------------
-    if sys.platform != "win32":
+    # --- Spout / Syphon -----------------------------------------------------
+    if sys.platform == "darwin":
+        try:
+            from .syphon_out import SYPHON_AVAILABLE, SYPHON_ERROR
+            if SYPHON_AVAILABLE:
+                from importlib.metadata import version as _v
+                try:
+                    ver = _v("syphon-python")
+                except Exception:
+                    ver = "installed"
+                from .config import SYPHON_SERVER
+                _line(OK, "Syphon", f"syphon-python {ver}, "
+                      f"{SYPHON_SERVER} server (SYPHON_SERVER)")
+            else:
+                failures += 1
+                _line(BAD, "Syphon", SYPHON_ERROR)
+        except Exception as exc:
+            failures += 1
+            _line(BAD, "Syphon", str(exc))
+        from .macos import keep_awake_available
+        ok, detail = keep_awake_available()
+        _line(OK if ok else WARN, "App Nap opt-out", detail)
+    elif sys.platform != "win32":
         _line(WARN, "SpoutGL", "not applicable - Spout is Windows-only")
     else:
         try:
@@ -118,35 +147,57 @@ def run() -> int:
     # --- JavaScript runtime -------------------------------------------------
     # yt-dlp needs one to solve YouTube's signature challenges. Without it,
     # extraction falls back to clients that now demand a PO token and 403.
-    deno = shutil.which("deno")
-    if deno:
+    # The token generator runs on the same Node.
+    node = find_node()
+    if node:
         try:
-            out = subprocess.run([deno, "--version"], capture_output=True,
+            out = subprocess.run([node, "--version"], capture_output=True,
                                  text=True, timeout=20)
             first = (out.stdout or out.stderr).strip().splitlines()[0]
-            _line(OK, "JS runtime (deno)", f"{first}  @ {deno}")
+            major = node_major(first)
+            if major is not None and major < NODE_MIN_MAJOR:
+                failures += 1
+                _line(BAD, "JS runtime (Node.js)",
+                      f"{first} is too old, {NODE_MIN_MAJOR} or newer is "
+                      f"needed  @ {node}")
+                print("        -> re-run setup.ps1, which installs Node.js "
+                      "in the folder 'node'")
+            else:
+                _line(OK, "JS runtime (Node.js)", f"{first}  @ {node}")
         except Exception as exc:
-            _line(WARN, "JS runtime (deno)", f"found but would not run: {exc}")
+            _line(WARN, "JS runtime (Node.js)", f"found but would not run: {exc}")
+        if npm_cli(node) is None:
+            _line(WARN, "npm", f"not found beside {node} - the app cannot "
+                  "rebuild the token generator by itself")
     else:
         failures += 1
-        _line(BAD, "JS runtime (deno)", "not found - YouTube formats will 403")
-        print("        -> re-run setup.ps1, which downloads deno.exe here")
+        _line(BAD, "JS runtime (Node.js)", "not found - YouTube formats will 403")
+        print("        -> re-run setup.ps1, which installs Node.js in the "
+              "folder 'node'")
+
+    # Before 1.1 the runtime was deno. A deno.exe left behind does no harm -
+    # yt-dlp is told to use Node only - but it is 100 MB of nothing.
+    stale_deno = project_root() / "deno.exe"
+    if stale_deno.is_file():
+        _line(OK, "deno.exe", "no longer used since 1.1 - you can delete it")
 
     # --- does yt-dlp itself see the runtime? --------------------------------
-    # "deno is on PATH" and "yt-dlp is using deno" are different claims, and
+    # "Node is installed" and "yt-dlp is using Node" are different claims, and
     # only the second one matters.
-    if ytdlp and deno:
+    if ytdlp and node:
         try:
             helptext = subprocess.run([*ytdlp, "--help"], capture_output=True,
                                       text=True, timeout=90).stdout
-            if "--js-runtimes" in helptext:
-                _line(OK, "yt-dlp <- deno",
-                      f"will be passed explicitly as deno:{deno}")
+            if "--no-js-runtimes" in helptext:
+                _line(OK, "yt-dlp <- Node.js",
+                      f"will be passed explicitly as node:{node}")
             else:
-                _line(WARN, "yt-dlp <- deno",
-                      "this yt-dlp has no --js-runtimes option; relying on PATH")
+                failures += 1
+                _line(BAD, "yt-dlp <- Node.js",
+                      "this yt-dlp cannot be told to use Node.js "
+                      "(no --no-js-runtimes option) - update yt-dlp")
         except Exception as exc:
-            _line(WARN, "yt-dlp <- deno", f"could not ask yt-dlp: {exc}")
+            _line(WARN, "yt-dlp <- Node.js", f"could not ask yt-dlp: {exc}")
 
     # --- PO token provider ---------------------------------------------------
     # The single most consequential check here: without one, YouTube serves the
@@ -155,23 +206,26 @@ def run() -> int:
     # versions_agree plus this function's own later import of the same name
     # made it a local for the whole of run() - so the earlier call raised
     # UnboundLocalError, in a diagnostic tool, at the point it was diagnosing.
-    from .potprovider import (find_executable, find_script_home, get_provider,
+    from .potprovider import (built_script, find_executable,
+                              find_script_home, get_provider,
                               plugin_version, script_probe,
                               server_version, versions_agree)
     # What the app will actually use, asked in the order the app asks it. This
     # block used to assume script mode always won, which since 0.9.2 it does
-    # not - and it reported a perfectly working deno server as a broken script
+    # not - and it reported a perfectly working token server as a broken script
     # mode, with a red FAIL and "will not work correctly yet".
     provider = get_provider()
     script_home = find_script_home()
     pot_exe = find_executable()
     started_here = not provider.running and provider.start()
+    if not provider.running:
+        provider.wait_settled()
     server_up = provider.running
 
     if server_up:
         kind = provider.server_kind or "unknown"
         _line(OK, "PO token provider", f"{kind} server - {provider.status}")
-        if kind == "deno":
+        if kind == "node":
             print("        -> the generator's own server, from the same release as")
             print("           the plugin, so the two cannot disagree on protocol")
     elif script_home:
@@ -187,17 +241,20 @@ def run() -> int:
     # Script mode as the spare. Run it rather than looking for node_modules: a
     # release once shipped a node_modules that existed, weighed half a gigabyte
     # and resolved nothing, because zipping had dereferenced deno's symlinks.
+    # The same holds for build/: a file being there is not the same as it
+    # running.
     if script_home:
         from pathlib import Path as _P
         script_ready, detail = script_probe(script_home)
         if script_ready:
             _line(OK, "token generator (script mode)", f"ready: {script_home}")
-        elif not (_P(script_home) / "node_modules").is_dir():
+        elif not (_P(script_home) / "node_modules").is_dir() \
+                or built_script(script_home) is None:
             _line(WARN, "token generator (script mode)",
-                  "present, dependencies not built yet")
-            print("        -> the app builds them on first launch (about a "
-                  "minute, needs the network)")
-            print("           or run 'deno install' in " + script_home)
+                  "present, not built yet")
+            print("        -> the app builds it on first launch (a few "
+                  "minutes, needs the network)")
+            print("           or re-run setup.ps1")
         else:
             # Only fatal when it is the only thing that could issue a token.
             if server_up:
@@ -271,6 +328,10 @@ def run() -> int:
     from .cookies import export as export_cookies
     from .cookies import profile_path, sweep_stale
     from .cookies import resolve as resolve_cookies
+    from .cookies import check as login_check
+    signed_in, problem = login_check(COOKIES_FROM_BROWSER)
+    _line(OK if signed_in else WARN, "YouTube login",
+          "signed in" if signed_in else problem)
     if not COOKIES_FROM_BROWSER:
         _line(OK, "cookies", "not configured (set COOKIES_FROM_BROWSER "
                              "in settings.txt)")
@@ -354,8 +415,7 @@ def run() -> int:
 
         app = QApplication.instance() or QApplication([])
         fmt = QSurfaceFormat()
-        fmt.setVersion(3, 3)
-        fmt.setProfile(QSurfaceFormat.CompatibilityProfile)
+        apply_gl_profile(fmt)
         surface = QOffscreenSurface()
         surface.setFormat(fmt)
         surface.create()

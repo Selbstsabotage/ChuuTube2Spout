@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""ChuuTube2Spout - YouTube (and any mpv-playable URL) to Spout, for VJ use.
+"""ChuuTubePoi - YouTube (and any mpv-playable URL) to Spout and Syphon, for VJ use.
 
 Copyright (C) 2026 Djinn
 
@@ -18,7 +18,12 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 
 LICENSE = "GPL-3.0-or-later"
 
-APP_NAME = "ChuuTube2Spout"
+APP_NAME = "ChuuTubePoi"
+# What the app was called before, newest first: ChuuTube2Spout until 1.1 (the
+# name stopped fitting once it also sent Syphon), yt2spout before that. Window
+# state saved under these names is carried over once (ui._migrate_settings).
+# Not written as one word, so that a rename across the tree leaves it alone.
+LEGACY_APP_NAMES = ("ChuuTube2" + "Spout", "yt2" + "spout")
 
 # Renumbered ahead of the first public release: 1.0 is the version that gets
 # published, so everything before it counts up through 0.9.x. The 3.x numbers
@@ -38,7 +43,7 @@ APP_NAME = "ChuuTube2Spout"
 # before it builds. Flip it in the same commit that tags and uploads 1.0.
 PUBLISHED = True
 
-__version__ = "1.0"
+__version__ = "1.1"
 
 
 def version_tuple(version: str = "") -> tuple[int, ...]:

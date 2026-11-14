@@ -1,7 +1,7 @@
 # SHA-256 of every artifact setup.ps1 downloads.
 #
 # WHY THIS FILE EXISTS
-# Three of the things setup.ps1 fetches are executed - 7zr.exe, deno.exe and
+# Three of the things setup.ps1 fetches are executed - 7zr.exe, Node.js and
 # bgutil-pot.exe - and one is a native DLL loaded into the app's own process.
 # Without a recorded hash, "what the maintainer tested" and "whatever the
 # supplier is serving the moment you run setup" are the same thing, and there is
@@ -24,18 +24,20 @@
 #   3. powershell -ExecutionPolicy Bypass -File setup.ps1 -Portable -Pin
 #   4. run the app and play something - -Pin records what downloaded, not what
 #      works
-#   5. cross-check the recorded hash against the SHA-256 GitHub shows on the
-#      release asset, then commit setup.ps1 and this file together
+#   5. cross-check the recorded hash against the SHA-256 the publisher shows
+#      (GitHub on the release asset; for Node.js, SHASUMS256.txt), then
+#      commit setup.ps1 and this file together
 #
 # Step 5 is the one that matters. Without it a pin only certifies that nothing
 # changed since you last downloaded it, which is not the same as saying what
-# you downloaded was genuine. Everything here now comes from a GitHub release,
-# and GitHub publishes each asset's digest:
+# you downloaded was genuine. Everything here comes from a GitHub release,
+# where GitHub publishes each asset's digest, except Node.js, which publishes
+# SHASUMS256.txt beside each release on nodejs.org:
 #   mpv     https://github.com/shinchiro/mpv-winbuild-cmake/releases
 #           (keeps only its latest 30 builds - a pinned one is deleted after
 #           a few weeks, and setup then falls back to the newest build,
 #           verified against the digest GitHub publishes for it)
-#   deno    https://github.com/denoland/deno/releases
+#   Node.js https://nodejs.org/dist/  (SHASUMS256.txt in each version's folder)
 #   7-Zip   https://github.com/ip7z/7zip/releases
 #   bgutil  https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs/releases
 # 7-zip.org publishes no checksums at all, anywhere, which is why 7zr.exe is
@@ -50,4 +52,12 @@ e95324ee24b1b0f1b4ad43d336343afe7cf1914acdf65d9cc1977f51d7b137c2  bgutil-ytdlp-p
 # 7-Zip 26.03. Cross-checked against the digest GitHub shows on the ip7z
 # release asset, not merely recorded from a download.
 ad4c82fadcbdf93c03b4fc440f300509c7d60c5c2f4d183e35d9d70d6957037d  7zr.exe
-a0c3101b4158d1dfb7d6a78a7bf0f3de80c96bb423c152beec8beb22786f2238  deno-x86_64-pc-windows-msvc.zip
+
+# Node.js 26.13.0 LTS (1.1). Taken from the SHASUMS256 list on the release
+# page, https://nodejs.org/en/blog/release/v26.13.0. The Windows zip has
+# since matched it on a real download (K, 2026-11-09). The two macOS
+# tarballs (setup.sh, 1.1) come from the same list and have not been
+# downloaded yet.
+dcc60d59a0746999f99064a01c020445d54d84228c691cdbf25b49ac3b59150a  node-v26.13.0-win-x64.zip
+d38bd5e5a2ddce6bbb5ce45e46e208337da4d51fffe611e567fd32073d6439f6  node-v26.13.0-darwin-arm64.tar.gz
+525c9b29bb0263d687de60a4cec0e2a6db876a8eb032369e5795eca71e7c358e  node-v26.13.0-darwin-x64.tar.gz

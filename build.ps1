@@ -1,7 +1,7 @@
 <#
-    ChuuTube2Spout release build (Windows)
+    ChuuTubePoi release build (Windows)
 
-    Produces dist\ChuuTube2Spout\ - a folder that runs on a machine with no
+    Produces dist\ChuuTubePoi\ - a folder that runs on a machine with no
     Python and no setup step - and zips it.
 
         powershell -ExecutionPolicy Bypass -File build.ps1
@@ -19,7 +19,7 @@
 $ErrorActionPreference = "Stop"
 $Root   = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $VenvPy = Join-Path $Root ".venv\Scripts\python.exe"
-$Dist   = Join-Path $Root "dist\ChuuTube2Spout"
+$Dist   = Join-Path $Root "dist\ChuuTubePoi"
 
 function Say($m)  { Write-Host "==> $m" -ForegroundColor Cyan }
 function Warn($m) { Write-Host "!!  $m" -ForegroundColor Yellow }
@@ -57,8 +57,8 @@ Say "Running the tests first"
 & $VenvPy -m unittest discover -s (Join-Path $Root "tests") -q
 if ($LASTEXITCODE -ne 0) { Die "tests failed - not building a release from this" }
 
-$version = (& $VenvPy -c "import sys; sys.path.insert(0,r'$Root'); from chuutube2spout import __version__; print(__version__)").Trim()
-Say "Building ChuuTube2Spout $version"
+$version = (& $VenvPy -c "import sys; sys.path.insert(0,r'$Root'); from chuutubepoi import __version__; print(__version__)").Trim()
+Say "Building ChuuTubePoi $version"
 
 # checksums.txt has to be populated. It is the only thing that lets whoever
 # downloads this release verify that the binaries they fetch are the ones that
@@ -101,8 +101,11 @@ Remove-Item -Recurse -Force (Join-Path $Root "build"), (Join-Path $Root "dist") 
 # --collect-all OpenGL: PyOpenGL chooses its platform backend at runtime.
 $pyiArgs = @(
     "--noconfirm", "--clean",
-    "--name", "ChuuTube2Spout",
+    "--name", "ChuuTubePoi",
     "--onedir", "--console",
+    # The exe's own icon, and the picture its windows show (bootstrap.icon_file).
+    "--icon", (Join-Path $Root "assets\ChuuTubePoi.ico"),
+    "--add-data", ((Join-Path $Root "assets\icon.png") + ";assets"),
     "--collect-all", "yt_dlp",
     "--collect-all", "yt_dlp_plugins",
     "--collect-all", "bgutil_ytdlp_pot_provider",
@@ -117,8 +120,8 @@ if ($LASTEXITCODE -ne 0) { Die "PyInstaller failed - see above" }
 if (-not (Test-Path $Dist)) { Die "PyInstaller produced no dist folder" }
 
 # ------------------------------------------------- assemble the release ------
-# The native runtime is deliberately NOT in the zip: not libmpv, not deno, not
-# the token generator. Bundling them means redistributing them, and they are the
+# The native runtime is deliberately NOT in the zip: not libmpv, not Node.js,
+# not the token generator. Bundling them means redistributing them, and they are the
 # parts that carry the heaviest terms - libmpv's Windows builds are GPL because
 # of their codec components, and both halves of the token generator are GPL-3.0.
 # Shipping them would make whoever publishes this release answerable for all of
@@ -144,7 +147,7 @@ foreach ($name in @("setup.ps1", "checksums.txt")) {
 # PowerShell" on a .ps1 is blocked by the default execution policy anyway.
 $runtimeBat = @"
 @echo off
-REM Fetches the pieces that are not in the zip: libmpv, deno and the PO token
+REM Fetches the pieces that are not in the zip: libmpv, Node.js and the PO token
 REM generator. They come from their own projects rather than from this release
 REM so that nobody is redistributing them on your behalf. Needs the internet
 REM once; after this the app runs offline apart from fetching clips.
@@ -162,8 +165,8 @@ Say "  + setup-runtime.bat  (run this first)"
 # testers with no doctor, no check and no way to update yt-dlp.
 Say "Adding the helper scripts"
 $bats = @{
-    "doctor.bat" = "ChuuTube2Spout.exe --doctor"
-    "clear-cache.bat" = "ChuuTube2Spout.exe --clear-cache"
+    "doctor.bat" = "ChuuTubePoi.exe --doctor"
+    "clear-cache.bat" = "ChuuTubePoi.exe --clear-cache"
 }
 foreach ($name in $bats.Keys) {
     @(
@@ -193,7 +196,7 @@ foreach ($name in $bats.Keys) {
     "    pause",
     "    exit /b 1",
     ")",
-    "ChuuTube2Spout.exe --check %*",
+    "ChuuTubePoi.exe --check %*",
     "pause",
     "endlocal"
 ) | Set-Content -Path (Join-Path $Dist "check.bat") -Encoding ASCII
@@ -205,12 +208,12 @@ Say "  + check.bat"
 # worse than not shipping one.
 @(
     "@echo off",
-    "echo yt-dlp is built into ChuuTube2Spout.exe and cannot be updated on its own.",
+    "echo yt-dlp is built into ChuuTubePoi.exe and cannot be updated on its own.",
     "echo.",
     "echo If a URL that used to work has stopped loading, YouTube has most likely",
     "echo changed something and a newer release will carry a newer yt-dlp.",
     "echo.",
-    "ChuuTube2Spout.exe --yt-dlp --version",
+    "ChuuTubePoi.exe --yt-dlp --version",
     "pause"
 ) | Set-Content -Path (Join-Path $Dist "update-ytdlp.bat") -Encoding ASCII
 Say "  + update-ytdlp.bat  (reports the bundled version)"
@@ -249,7 +252,8 @@ $forbidden = @(
     @{ Path = "logs";            Why = "your session logs" }
     @{ Path = "mpv-2.dll";       Why = "GPL runtime - the user fetches this" }
     @{ Path = "libmpv-2.dll";    Why = "GPL runtime - the user fetches this" }
-    @{ Path = "deno.exe";        Why = "the user fetches this" }
+    @{ Path = "node";            Why = "Node.js - the user fetches this" }
+    @{ Path = "deno.exe";        Why = "no longer used (before 1.1)" }
     @{ Path = "bgutil-pot.exe";  Why = "GPL-3.0 - the user fetches this" }
     @{ Path = "bgutil-server";   Why = "GPL-3.0 - the user fetches this" }
     @{ Path = ".venv";           Why = "your build environment" }
@@ -267,7 +271,7 @@ if ($have -ne $want) {
 if ($found.Count) {
     Write-Host ""
     foreach ($line in $found) { Write-Host $line -ForegroundColor Red }
-    Die "the build folder holds $($found.Count) thing(s) that must not be published. Delete them from dist\ChuuTube2Spout and build again."
+    Die "the build folder holds $($found.Count) thing(s) that must not be published. Delete them from dist\ChuuTubePoi and build again."
 }
 Say "Nothing in the build that should not be published"
 
@@ -275,7 +279,7 @@ Say "Nothing in the build that should not be published"
 # The single most likely way this build is broken: yt-dlp did not get collected,
 # so the app launches fine and then cannot fetch anything. Ask the exe.
 Say "Checking the built exe can run yt-dlp"
-$exe = Join-Path $Dist "ChuuTube2Spout.exe"
+$exe = Join-Path $Dist "ChuuTubePoi.exe"
 $ytv = (& $exe --yt-dlp --version 2>&1 | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or -not ($ytv -match "\d{4}\.\d{2}\.\d{2}")) {
     Die "the built exe cannot run yt-dlp (got: '$ytv'). The build is not usable - check the --collect-all flags."
@@ -283,7 +287,7 @@ if ($LASTEXITCODE -ne 0 -or -not ($ytv -match "\d{4}\.\d{2}\.\d{2}")) {
 Say "  yt-dlp $ytv responds from inside the exe"
 
 # ------------------------------------------------------------------ zip ------
-$zip = Join-Path $Root "dist\ChuuTube2Spout-$version-win64.zip"
+$zip = Join-Path $Root "dist\ChuuTubePoi-$version-win64.zip"
 Say "Zipping"
 Compress-Archive -Path $Dist -DestinationPath $zip -Force
 $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
@@ -304,7 +308,7 @@ Warn "    present. It must OFFER to install rather than just failing, the"
 Warn "    install must finish, and the app must then open. Read the dialog:"
 Warn "    if it fails it should point DOWN to the log, not up."
 Warn "  * Senders before any video. Open Resolume with both slots empty."
-Warn "    ChuuTube2Spout-A and -B must already be in the source list,"
+Warn "    ChuuTubePoi-A and -B must already be in the source list,"
 Warn "    transparent at the canvas size."
 Warn "  * The canvas holds. Load a 4:3 or vertical clip and confirm it"
 Warn "    arrives at the same size as everything else, with bars, unsquashed."

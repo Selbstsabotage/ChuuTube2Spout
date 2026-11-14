@@ -16,10 +16,10 @@ block is on your address rather than your configuration.
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 
 from . import APP_NAME
+from .bootstrap import find_node
 from .config import (AUTO_CLIENT, CLIENT_CHAIN, CODEC_PREFERENCE,
                      COOKIES_FROM_BROWSER)
 from .httpu import content_length_from_url
@@ -58,7 +58,7 @@ _PAST_END = "416"
 
 
 def _js_runtime() -> str:
-    exe = shutil.which("deno")
+    exe = find_node()
     if not exe:
         return "NOT FOUND - yt-dlp cannot solve YouTube's signature challenges"
     try:
@@ -91,7 +91,7 @@ def run(url: str) -> int:
         print("yt-dlp is not installed here. Run setup.ps1.")
         return 2
 
-    print(f"JS runtime (deno): {_js_runtime()}")
+    print(f"JS runtime (Node.js): {_js_runtime()}")
     print(f"codec preference: {', '.join(CODEC_PREFERENCE)}")
     if COOKIES_FROM_BROWSER:
         print(f"cookies from: {COOKIES_FROM_BROWSER}")
@@ -172,14 +172,14 @@ def run(url: str) -> int:
             print("It is already trying that one first, so there is nothing to set.")
         elif pinnable:
             print("To skip straight to a known-good one, put this in run.bat:")
-            print(f"    set CHUUTUBE2SPOUT_PLAYER_CLIENT={pinnable[0]}")
+            print(f"    set CHUUTUBEPOI_PLAYER_CLIENT={pinnable[0]}")
         return 0
 
     if partial:
         print(f"Serves the opening chunk then refuses the rest: {', '.join(partial)}")
         print("\nThat is YouTube's PO-token gate, not an IP block - the start of")
         print("the file is free, the rest is not. Signing in is the fix:")
-        print("    set CHUUTUBE2SPOUT_COOKIES_FROM_BROWSER=firefox")
+        print("    set CHUUTUBEPOI_COOKIES_FROM_BROWSER=firefox")
         print("  (chrome, edge, brave, vivaldi, opera also accepted; use a browser")
         print("   where you are logged into YouTube, and close it first)")
         return 1
@@ -191,7 +191,7 @@ def run(url: str) -> int:
         print("rather than the configuration.")
         print("\n  -> On a VPN? Turn it off and re-run.")
         print("  -> Otherwise sign in, which lifts most address-level throttling:")
-        print("       set CHUUTUBE2SPOUT_COOKIES_FROM_BROWSER=firefox")
+        print("       set CHUUTUBEPOI_COOKIES_FROM_BROWSER=firefox")
         print("     (chrome, edge, brave, vivaldi, opera, safari also accepted)")
         return 1
 

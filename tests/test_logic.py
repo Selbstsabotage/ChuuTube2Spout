@@ -16,6 +16,7 @@ import io
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import socket
 import sys
@@ -23,6 +24,13 @@ import sqlite3
 import stat
 import subprocess
 import tempfile
+
+# On a Mac the temp folder is reached through a link (/var -> /private/var).
+# The app resolves paths, so anything it reports about a temp folder carries
+# the real name and no longer equals the name the test made. Tester, 1.1: six
+# tests failed for that alone, and build-mac.sh stopped. All temp folders the
+# tests make now have the real name from the start.
+tempfile.tempdir = __import__("os").path.realpath(tempfile.gettempdir())
 import time
 import types
 import threading
@@ -33,42 +41,48 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+# On macOS the temp folder is reached through a link (/var -> /private/var).
+# The app resolves paths; a test that compares one with a folder it made
+# would then see two spellings of the same place (tester, 1.1: six tests
+# failed that way and stopped the Mac build). So: one spelling, the real one.
+tempfile.tempdir = os.path.realpath(tempfile.gettempdir())
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 ROOT = Path(__file__).resolve().parent.parent
 
 import stubs_bootstrap  # noqa: F401  (installs the fake modules)
 import stubs
 
-import chuutube2spout
-from chuutube2spout import app as app_mod
-from chuutube2spout import bootstrap
-from chuutube2spout import firstrun
-from chuutube2spout import headerproxy
-from chuutube2spout import urlcheck
-from chuutube2spout import config
-from chuutube2spout import doctor
-from chuutube2spout import downloader
-from chuutube2spout import cookies as cookies_mod
-from chuutube2spout import potprovider
-from chuutube2spout.downloader import (DownloadError, LocalClip, js_runtime_arg,
+import chuutubepoi
+from chuutubepoi import app as app_mod
+from chuutubepoi import bootstrap
+from chuutubepoi import firstrun
+from chuutubepoi import headerproxy
+from chuutubepoi import urlcheck
+from chuutubepoi import config
+from chuutubepoi import doctor
+from chuutubepoi import downloader
+from chuutubepoi import cookies as cookies_mod
+from chuutubepoi import potprovider
+from chuutubepoi.downloader import (DownloadError, LocalClip, js_runtime_arg,
                                  parse_progress, video_format)
-from chuutube2spout import player as player_mod
-from chuutube2spout import redact
-from chuutube2spout import resolver
-from chuutube2spout.urlcheck import _normalise
-from chuutube2spout import headerproxy
-from chuutube2spout.headerproxy import HeaderProxy, get_proxy, parse_range
-from chuutube2spout.player import Player, mpv_list, mpv_quote
-from chuutube2spout.resolver import ResolveError, Stream, is_direct, pick_audio, pick_video
-from chuutube2spout import theme
-from chuutube2spout import spout_out
-from chuutube2spout.spout_out import Sender, SpoutOutput
+from chuutubepoi import player as player_mod
+from chuutubepoi import redact
+from chuutubepoi import resolver
+from chuutubepoi.urlcheck import _normalise
+from chuutubepoi import headerproxy
+from chuutubepoi.headerproxy import HeaderProxy, get_proxy, parse_range
+from chuutubepoi.player import Player, mpv_list, mpv_quote
+from chuutubepoi.resolver import ResolveError, Stream, is_direct, pick_audio, pick_video
+from chuutubepoi import theme
+from chuutubepoi import spout_out
+from chuutubepoi.spout_out import Sender, SpoutOutput
 from PySide6.QtCore import Qt
-from chuutube2spout.surface import PreviewSurface, _fit
-from chuutube2spout import ui as ui_mod
-from chuutube2spout import surface as surface_mod
-from chuutube2spout import logfile
-from chuutube2spout.ui import MainWindow, fmt_time
+from chuutubepoi.surface import PreviewSurface, _fit
+from chuutubepoi import ui as ui_mod
+from chuutubepoi import surface as surface_mod
+from chuutubepoi import logfile
+from chuutubepoi.ui import MainWindow, fmt_time
 
 
 @contextlib.contextmanager
@@ -97,8 +111,9 @@ def audio_enabled():
         player_mod.FETCH_AUDIO, downloader.FETCH_AUDIO = saved
 
 
-# The suite must never shell out to deno. script_probe would run the real
-# generator and install_script_deps would spend a minute building node_modules -
+# The suite must never shell out to Node.js (deno before 1.1). script_probe
+# would run the real generator and install_script_deps would spend minutes on
+# npm ci and tsc -
 # once per MainWindow, and the tests build a lot of them. The real functions are
 # kept so ScriptProbeTests can still exercise them directly.
 _REAL_SCRIPT_PROBE = potprovider.script_probe
@@ -112,6 +127,40 @@ _REAL_AFTER_READY = potprovider.PotProvider._after_ready
 _REAL_LOCAL_SERVER_ROOT = potprovider.local_server_root
 potprovider.PotProvider._after_ready = lambda self: None
 potprovider.local_server_root = lambda: None
+# Nor may it find the real Node.js: the app looks in its own folder and on
+# PATH, and a developer's machine has one in either. Every module that asks is
+# told there is none. A test that needs Node to look present patches the
+# module it is testing; nothing it then runs may reach a real subprocess.
+_REAL_FIND_NODE = bootstrap.find_node
+for _module in (potprovider, downloader, doctor, urlcheck):
+    _module.find_node = lambda: None
+# Nor the real bgutil-pot.exe. Every MainWindow the tests build calls
+# provider.start(), which looks for the exe beside the app. Run with a Python
+# that lacks the bgutil plugin (K's `python`, not the venv's), the version
+# check has nothing to compare and lets it through - and 1.0.1's first test run
+# started K's real exe and left it on port 4416, where the app then found it
+# as an "external server" and never started its own.
+_REAL_FIND_EXECUTABLE = potprovider.find_executable
+potprovider.find_executable = lambda: None
+# Nor the developer's own generator tree. With the exe gone, start() went on
+# to script mode, found K's real bgutil-server beside the app, and wrote the
+# ready marker into it after a stubbed probe. potprovider now sees an empty
+# folder unless a test gives it another.
+_SUITE_ROOT = Path(tempfile.mkdtemp(prefix="chuutube-suite-root-"))
+potprovider.project_root = lambda: _SUITE_ROOT
+# Nor anything really listening on the token port - K's own server, if one
+# runs - and no waiting for it: on Windows a refused connection to localhost
+# takes about a second, and every MainWindow asks. 1.0.2's test run took
+# 174 s instead of 24 s for exactly this. Other ports (the tests' own
+# servers) are still really probed.
+_REAL_PORT_IS_OPEN = potprovider.port_is_open
+potprovider.port_is_open = (
+    lambda port, host=None, timeout=0.4:
+    False if port == potprovider.DEFAULT_PORT
+    else _REAL_PORT_IS_OPEN(port, host, timeout))
+# And no `node --version` from the server command: Node 26 is what setup
+# installs. Tests of the version rule pass a version themselves.
+potprovider.node_major = lambda node: 26
 
 
 class MpvQuotingTests(unittest.TestCase):
@@ -233,6 +282,1824 @@ class SpoutRoutingTests(unittest.TestCase):
         self.assertEqual(SpoutOutput().names(),
                          [config.SENDER_A, config.SENDER_B])
         self.assertFalse(hasattr(SpoutOutput(), "program"))
+
+
+class _FakeSyphonServer:
+    """Stands in for syphon.SyphonOpenGLServer: records, never touches a GPU."""
+
+    created = []
+
+    def __init__(self, name, *args, **kwargs):
+        self.name = name
+        self.published = []
+        self.stopped = False
+        self.fail = False
+        _FakeSyphonServer.created.append(self)
+
+    def publish_frame_texture(self, texture, region=None, size=None,
+                              is_flipped=False, target=3553):
+        if self.fail:
+            raise RuntimeError("no CGL context")
+        self.published.append((texture, size, is_flipped))
+
+    def stop(self):
+        self.stopped = True
+
+
+class YouTubeLoginCheckTests(unittest.TestCase):
+    """1.0.5: say at start, once, when the cookies carry no YouTube login."""
+
+    NOW = 1_800_000_000
+
+    def setUp(self):
+        from chuutubepoi import cookies
+        self.mod = cookies
+        self.dir = Path(tempfile.mkdtemp(prefix="chuutube-logincheck-"))
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def _profile(self, rows):
+        profile = self.dir / "p.default"
+        profile.mkdir(exist_ok=True)
+        db = sqlite3.connect(str(profile / "cookies.sqlite"))
+        db.execute("CREATE TABLE moz_cookies (id INTEGER, host TEXT, path TEXT,"
+                   " isSecure INTEGER, expiry INTEGER, name TEXT, value TEXT)")
+        db.executemany("INSERT INTO moz_cookies VALUES (?,?,?,?,?,?,?)",
+                       [(i, h, "/", 1, e, n, "v") for i, (h, n, e) in enumerate(rows)])
+        db.commit()
+        db.close()
+        return f"firefox:{profile}"
+
+    def test_a_live_login_is_ok(self):
+        value = self._profile([(".youtube.com", "LOGIN_INFO", self.NOW + 3600),
+                               (".youtube.com", "PREF", self.NOW + 3600)])
+        self.assertEqual(self.mod.check(value, now=self.NOW), (True, ""))
+
+    def test_milliseconds_are_read_as_milliseconds(self):
+        # Newer Firefox stores the expiry in ms.
+        value = self._profile([(".youtube.com", "SAPISID", (self.NOW + 60) * 1000)])
+        self.assertTrue(self.mod.check(value, now=self.NOW)[0])
+
+    def test_an_expired_login_in_milliseconds_is_expired(self):
+        # Read as seconds, a millisecond expiry lies thousands of years ahead.
+        value = self._profile([(".youtube.com", "SAPISID", (self.NOW - 60) * 1000)])
+        self.assertFalse(self.mod.check(value, now=self.NOW)[0])
+
+    def test_a_session_cookie_counts_as_live(self):
+        value = self._profile([(".youtube.com", "SID", 0)])
+        self.assertTrue(self.mod.check(value, now=self.NOW)[0])
+
+    def test_an_expired_login_says_so(self):
+        value = self._profile([(".youtube.com", "LOGIN_INFO", self.NOW - 1)])
+        ok, problem = self.mod.check(value, now=self.NOW)
+        self.assertFalse(ok)
+        self.assertIn("expired", problem)
+
+    def test_youtube_cookies_without_a_login(self):
+        value = self._profile([(".youtube.com", "PREF", self.NOW + 60),
+                               (".youtube.com", "VISITOR_INFO1_LIVE", self.NOW + 60)])
+        ok, problem = self.mod.check(value, now=self.NOW)
+        self.assertFalse(ok)
+        self.assertIn("not signed in", problem)
+
+    def test_a_google_login_elsewhere_is_not_a_youtube_login(self):
+        value = self._profile([("accounts.google.com", "SID", self.NOW + 60)])
+        ok, problem = self.mod.check(value, now=self.NOW)
+        self.assertFalse(ok)
+        self.assertIn("no YouTube cookies", problem)
+
+    def test_no_browser_set(self):
+        ok, problem = self.mod.check("")
+        self.assertFalse(ok)
+        self.assertIn("COOKIES_FROM_BROWSER", problem)
+
+    def test_an_unreadable_browser_never_raises(self):
+        with mock.patch.object(self.mod, "_ytdlp_rows",
+                               lambda v: (_ for _ in ()).throw(OSError("no keychain"))):
+            ok, problem = self.mod.check("chrome")
+        self.assertFalse(ok)
+        self.assertIn("no keychain", problem)
+
+    def test_other_browsers_go_through_yt_dlp(self):
+        seen = []
+        def rows(value):
+            seen.append(value)
+            return [(".youtube.com", "LOGIN_INFO", self.NOW + 60)]
+        with mock.patch.object(self.mod, "_ytdlp_rows", rows):
+            self.assertTrue(self.mod.check("chrome:Profile 1", now=self.NOW)[0])
+        self.assertEqual(seen, ["chrome:Profile 1"])
+
+
+class _FakeBox:
+    """Stands in for QMessageBox: what it says, its buttons, how it is shown."""
+
+    Warning, Information, Ok, ActionRole = 2, 1, 1, 3
+
+    class _Button:
+        def __init__(self, text):
+            self.text = text
+            self.clicked = stubs._BoundSignal()
+
+    @classmethod
+    def make(cls, shown: list):
+        class Box(cls):
+            def __init__(self, icon, title, text, buttons=None, parent=None):
+                self.title, self.text = title, text
+                self.modal = None
+                self.buttons = []
+            def addButton(self, text, role):
+                button = cls._Button(text)
+                self.buttons.append(button)
+                return button
+            def setModal(self, modal):
+                self.modal = modal
+            def show(self):
+                shown.append(self)
+            def exec(self):
+                self.modal = True
+                shown.append(self)
+                return 0
+        return Box
+
+
+class SettingsPathTests(unittest.TestCase):
+    """Where settings.txt is, named in full (K, 1.1)."""
+
+    def test_the_file_in_use(self):
+        with mock.patch.object(config, "SETTINGS_FILE", "/x/y/settings.txt"):
+            self.assertEqual(ui_mod.settings_path(), Path("/x/y/settings.txt"))
+
+    def test_or_where_it_would_be(self):
+        with mock.patch.object(config, "SETTINGS_FILE", None):
+            self.assertEqual(ui_mod.settings_path(),
+                             bootstrap.project_root() / "settings.txt")
+
+    def test_help_names_it_with_its_folder_button(self):
+        shown = []
+        with mock.patch.object(ui_mod, "QMessageBox", _FakeBox.make(shown)), \
+             mock.patch("chuutubepoi.logfile.path", lambda: "/d/logs/x.log"), \
+             mock.patch.object(ui_mod, "settings_path",
+                               lambda: Path("/d/settings.txt")):
+            MainWindow()._show_help()
+        self.assertEqual(len(shown), 1)
+        self.assertIn(str(Path("/d/settings.txt")), shown[0].text)
+        self.assertEqual([b.text for b in shown[0].buttons],
+                         [ui_mod.SETTINGS_BUTTON])
+
+
+class CookieWarningAtStartTests(unittest.TestCase):
+    def setUp(self):
+        self.w = MainWindow()
+        self.shown = []
+        shown = self.shown
+
+        self.Box = _FakeBox.make(shown)
+        patcher = mock.patch.object(ui_mod, "QMessageBox", self.Box)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_bad_login_is_shown_once_and_does_not_block(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.w._show_cookie_verdict(False, "it is not signed in to YouTube")
+        self.assertEqual(len(self.shown), 1)
+        self.assertFalse(self.shown[0].modal)
+        self.assertIn("not signed in", self.shown[0].text)
+        self.assertIn("COOKIE_WARNING=0", self.shown[0].text)
+
+    def test_it_names_settings_txt_in_full_and_offers_its_folder(self):
+        # K, 1.1: "make the warning show the full path for both windows and
+        # mac". The Mac app's settings.txt is hidden in ~/Library.
+        where = Path(tempfile.mkdtemp(prefix="chuutube-where-")) / "settings.txt"
+        self.addCleanup(shutil.rmtree, where.parent, True)
+        with mock.patch.object(ui_mod, "settings_path", lambda: where), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.w._show_cookie_verdict(False, "No browser is set")
+        box = self.shown[0]
+        self.assertIn(str(where), box.text)
+        self.assertEqual([b.text for b in box.buttons], [ui_mod.SETTINGS_BUTTON])
+        opened = ui_mod.QDesktopServices.opened
+        opened.clear()
+        box.buttons[0].clicked.emit()
+        self.assertEqual([u.toLocalFile() for u in opened], [str(where.parent)])
+
+    def test_a_good_login_shows_nothing(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.w._show_cookie_verdict(True, "")
+        self.assertEqual(self.shown, [])
+
+    def test_the_check_runs_once_per_start_from_the_first_show(self):
+        source = Path(ui_mod.__file__).read_text(encoding="utf-8")
+        show = source.split("def showEvent")[1].split("def _start_cookie_check")[0]
+        body = show.split("if not self._fitted:")[1]
+        self.assertIn("self._start_cookie_check()", body)
+
+    def test_cookie_warning_0_skips_it(self):
+        started = []
+        with mock.patch("threading.Thread",
+                        lambda *a, **k: started.append(1) or mock.Mock()), \
+             mock.patch.object(config, "COOKIE_WARNING", False):
+            self.w._start_cookie_check()
+        self.assertEqual(started, [])
+
+
+class SyphonFallbackWarningTests(unittest.TestCase):
+    """If the Metal path fails, the user is told transparency is gone (1.0.9)."""
+
+    def setUp(self):
+        self.w = MainWindow()
+        self.shown = []
+        shown = self.shown
+
+        class _Box:
+            Warning = 2
+            Ok = 1
+            def __init__(self, icon, title, text, buttons, parent):
+                self.title = title
+                self.text = text
+                self.modal = None
+            def setModal(self, modal):
+                self.modal = modal
+            def show(self):
+                shown.append(self)
+        patcher = mock.patch.object(ui_mod, "QMessageBox", _Box)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_shown_once_without_blocking_and_names_transparency(self):
+        self.w._show_syphon_fallback("ChuuTubePoi-A", "No module named 'Metal'")
+        self.w._show_syphon_fallback("ChuuTubePoi-B", "No module named 'Metal'")
+        self.assertEqual(len(self.shown), 1)
+        box = self.shown[0]
+        self.assertFalse(box.modal)
+        self.assertIn("Transparency will not work", box.text)
+        self.assertIn("No module named 'Metal'", box.text)
+        self.assertIn("ChuuTubePoi-A", box.text)
+
+    def test_the_window_hands_the_output_its_handler(self):
+        source = Path(ui_mod.__file__).read_text(encoding="utf-8")
+        self.assertIn("self.spout.set_fallback_handler(self.syphonFallback.emit)",
+                      source)
+        # Queued: the report comes from inside a frame.
+        self.assertIn("self.syphonFallback.connect(self._show_syphon_fallback,\n"
+                      "                                    Qt.QueuedConnection)",
+                      source)
+
+    def test_a_failing_metal_sender_reaches_the_box(self):
+        from chuutubepoi import syphon_out
+        _FakeMetalPath.created = []
+        _FakeMetalPath.fail_init = True
+        _FakeMetalPath.fail_publish = False
+        fake = types.SimpleNamespace(SyphonOpenGLServer=_FakeSyphonServer)
+        with mock.patch.object(syphon_out, "syphon", fake), \
+             mock.patch.object(syphon_out, "SYPHON_AVAILABLE", True), \
+             mock.patch.object(syphon_out, "_MetalPath", _FakeMetalPath), \
+             mock.patch.object(syphon_out, "_reset_draw_state", lambda: None), \
+             mock.patch.object(syphon_out.Sender, "_log_edge", lambda *a: None), \
+             contextlib.redirect_stderr(io.StringIO()):
+            out = syphon_out.SyphonOutput()
+            for sender in out.players:
+                sender.server_kind = "metal"
+            out.set_fallback_handler(self.w._show_syphon_fallback)
+            for _ in range(3):
+                out.publish([_FakeTarget(11), _FakeTarget(22)], False)
+        _FakeMetalPath.fail_init = False
+        self.assertEqual(len(self.shown), 1)
+        self.assertIn("Transparency will not work", self.shown[0].text)
+
+    def test_a_working_metal_sender_shows_nothing(self):
+        from chuutubepoi import syphon_out
+        _FakeMetalPath.created = []
+        _FakeMetalPath.fail_init = False
+        _FakeMetalPath.fail_publish = False
+        fake = types.SimpleNamespace(SyphonOpenGLServer=_FakeSyphonServer)
+        with mock.patch.object(syphon_out, "syphon", fake), \
+             mock.patch.object(syphon_out, "SYPHON_AVAILABLE", True), \
+             mock.patch.object(syphon_out, "_MetalPath", _FakeMetalPath), \
+             mock.patch.object(syphon_out, "_reset_draw_state", lambda: None), \
+             mock.patch.object(syphon_out.Sender, "_log_edge", lambda *a: None), \
+             contextlib.redirect_stderr(io.StringIO()):
+            out = syphon_out.SyphonOutput()
+            for sender in out.players:
+                sender.server_kind = "metal"
+            out.set_fallback_handler(self.w._show_syphon_fallback)
+            out.publish([_FakeTarget(11), _FakeTarget(22)], False)
+        self.assertEqual(self.shown, [])
+
+    def test_a_handler_that_fails_does_not_stop_the_frame(self):
+        from chuutubepoi import syphon_out
+        sender = syphon_out.Sender("x", server="metal")
+        def broken(name, reason):
+            raise RuntimeError("no window")
+        sender.on_fallback = broken
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            sender._fall_back(ImportError("Metal"))
+        self.assertEqual(sender.server_kind, "opengl")
+        self.assertIn("notice failed", err.getvalue())
+
+
+class SyphonOutputTests(unittest.TestCase):
+    """macOS output (since 1.1). syphon-python is replaced by a recorder."""
+
+    def setUp(self):
+        from chuutubepoi import syphon_out
+        self.mod = syphon_out
+        _FakeSyphonServer.created = []
+        fake = types.SimpleNamespace(SyphonOpenGLServer=_FakeSyphonServer)
+        # The OpenGL server: the one these tests can stand in for. The
+        # Metal path has its own tests, SyphonMetalPathTests.
+        for name, value in (("syphon", fake), ("SYPHON_AVAILABLE", True),
+                            ("SYPHON_FLIP", True), ("SYPHON_SERVER", "opengl")):
+            patcher = mock.patch.object(syphon_out, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.out = syphon_out.SyphonOutput()
+        self.targets = [_FakeTarget(11), _FakeTarget(22)]
+
+    def test_a_server_per_slot_named_like_the_spout_senders(self):
+        self.out.publish(self.targets, False)
+        self.assertEqual([s.name for s in _FakeSyphonServer.created],
+                         [config.SENDER_A, config.SENDER_B])
+
+    def test_the_texture_goes_out_at_its_size_and_flipped(self):
+        # Our FBO is top-down (what Spout wants); Syphon is OpenGL, bottom-up.
+        self.out.publish(self.targets, False)
+        tex, size, flipped = _FakeSyphonServer.created[0].published[-1]
+        self.assertEqual((tex, size, flipped), (11, (self.targets[0].w,
+                                                      self.targets[0].h), True))
+
+    def test_syphon_flip_0_sends_it_unflipped(self):
+        with mock.patch.object(self.mod, "SYPHON_FLIP", False):
+            self.out.publish(self.targets, False)
+        self.assertFalse(_FakeSyphonServer.created[0].published[-1][2])
+
+    def test_the_spout_setting_does_not_flip_syphon(self):
+        self.out.publish(self.targets, True)
+        self.assertTrue(_FakeSyphonServer.created[0].published[-1][2])
+
+    def test_one_server_for_the_whole_session(self):
+        for _ in range(3):
+            self.out.publish(self.targets, False)
+        self.assertEqual(len(_FakeSyphonServer.created), 2)
+        self.assertEqual(len(_FakeSyphonServer.created[0].published), 3)
+
+    def test_only_changed_slots_are_sent(self):
+        self.out.publish(self.targets, False, changed=[False, True])
+        self.assertEqual([s.name for s in _FakeSyphonServer.created],
+                         [config.SENDER_B])
+
+    def test_an_invalid_target_is_skipped(self):
+        self.out.publish([_FakeTarget(0), None], False)
+        self.assertEqual(_FakeSyphonServer.created, [])
+
+    def test_a_failure_is_logged_once_not_every_frame(self):
+        self.out.publish(self.targets, False)
+        _FakeSyphonServer.created[0].fail = True
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for _ in range(5):
+                self.out.publish(self.targets, False, changed=[True, False])
+        self.assertEqual(err.getvalue().count("failed"), 1)
+
+    def test_shutdown_stops_the_servers(self):
+        self.out.publish(self.targets, False)
+        self.out.shutdown()
+        self.assertTrue(all(s.stopped for s in _FakeSyphonServer.created))
+        self.assertFalse(any(sender.active for sender in self.out.players))
+
+    def test_it_has_everything_the_window_uses_of_spout(self):
+        for name in ("players", "available", "unavailable_reason", "publish",
+                     "names", "shutdown", "kind"):
+            with self.subTest(name):
+                self.assertTrue(hasattr(self.out, name))
+                self.assertTrue(hasattr(SpoutOutput(), name))
+        self.assertEqual((self.out.kind, SpoutOutput.kind), ("Syphon", "Spout"))
+
+    def test_off_a_mac_it_says_why(self):
+        import importlib
+        fresh = importlib.reload(self.mod)
+        self.addCleanup(importlib.reload, self.mod)
+        if sys.platform != "darwin":
+            self.assertFalse(fresh.SYPHON_AVAILABLE)
+            self.assertIn("macOS-only", fresh.SYPHON_ERROR)
+
+
+class SyphonAlphaCheckTests(unittest.TestCase):
+    """--syphon-check (1.0.5): does Syphon carry the transparent bars?"""
+
+    def setUp(self):
+        from chuutubepoi import syphoncheck
+        self.mod = syphoncheck
+
+    def test_the_test_frame_is_half_transparent_half_opaque_red(self):
+        data = self.mod.test_pixels()
+        w, h = self.mod.W, self.mod.H
+        self.assertEqual(len(data), w * h * 4)
+        row = (h // 2) * w * 4
+        self.assertEqual(tuple(data[row + 4 * (w // 4): row + 4 * (w // 4) + 4]),
+                         (0, 0, 0, 0))
+        self.assertEqual(tuple(data[row + 4 * (3 * w // 4): row + 4 * (3 * w // 4) + 4]),
+                         (255, 0, 0, 255))
+
+    def test_the_opaque_half_starts_with_a_green_stripe(self):
+        data = self.mod.test_pixels()
+        w = self.mod.W
+        def px(x, y):
+            at = (y * w + x) * 4
+            return tuple(data[at: at + 4])
+        self.assertEqual(px(3 * w // 4, 0), (0, 255, 0, 255))
+        self.assertEqual(px(3 * w // 4, self.mod.H - 1), (255, 0, 0, 255))
+        self.assertEqual(px(w // 4, 0), (0, 0, 0, 0))
+
+    def test_green_in_the_last_gl_row_is_upright(self):
+        green, red = (0, 255, 0, 255), (255, 0, 0, 255)
+        self.assertEqual(self.mod.orientation(green, red), "upright")
+        self.assertEqual(self.mod.orientation(red, green), "upside down")
+        self.assertIsNone(self.mod.orientation(red, red))
+        self.assertIsNone(self.mod.orientation((0, 0, 0, 0), (0, 0, 0, 0)))
+
+    def test_metal_must_match_the_opengl_server_sent_flipped(self):
+        same = {("opengl", False): "upside down", ("opengl", True): "upright",
+                ("metal", True): "upright"}
+        ok, sentence = self.mod.orientation_summary(same)
+        self.assertTrue(ok)
+        turned = dict(same)
+        turned[("metal", True)] = "upside down"
+        ok, sentence = self.mod.orientation_summary(turned)
+        self.assertFalse(ok)
+        self.assertIn("turned over", sentence)
+        ok, sentence = self.mod.orientation_summary({("opengl", True): None,
+                                                     ("metal", True): "upright"})
+        self.assertFalse(ok)
+        self.assertIn("could not be read", sentence)
+
+    def test_it_prints_the_settings_in_effect(self):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.mod._print_settings()
+        text = out.getvalue()
+        self.assertIn("SYPHON_FLIP=", text)
+        self.assertIn("SYPHON_SERVER=", text)
+        self.assertIn(chuutubepoi.__version__, text)
+
+    def test_the_loopbacks_report_which_way_up(self):
+        source = Path(self.mod.__file__).read_text(encoding="utf-8")
+        run = source.split("def run(")[1].split("# --- --syphon-pattern")[0]
+        self.assertIn("orientation_summary(found)", run)
+        self.assertIn("all(results) and ok", run)
+
+    def test_alpha_0_arriving_blames_the_receiver(self):
+        ok, sentence = self.mod.verdict((0, 0, 0, 0), (255, 0, 0, 255))
+        self.assertTrue(ok)
+        self.assertIn("Resolume", sentence)
+
+    def test_alpha_255_arriving_blames_syphon(self):
+        ok, sentence = self.mod.verdict((0, 0, 0, 255), (255, 0, 0, 255))
+        self.assertFalse(ok)
+        self.assertIn("loses transparency", sentence)
+
+    def test_a_broken_receive_is_not_mistaken_for_either(self):
+        ok, sentence = self.mod.verdict((0, 0, 0, 0), (0, 0, 0, 0))
+        self.assertFalse(ok)
+        self.assertIn("test itself failed", sentence)
+
+    def test_off_a_mac_it_says_so(self):
+        if sys.platform == "darwin":
+            self.skipTest("this is a Mac")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.mod.run(), 2)
+        self.assertIn("macOS", out.getvalue())
+
+    def test_the_flag_reaches_it_without_starting_the_log(self):
+        source = Path(app_mod.__file__).read_text(encoding="utf-8")
+        self.assertIn('"--clear-cache", "--syphon-check"', source)
+        self.assertIn("from .syphoncheck import run as run_syphon_check", source)
+
+    def test_the_pattern_is_a_4_3_picture_with_transparent_bars(self):
+        m = self.mod
+        data = m.pattern_rows()
+        self.assertEqual(len(data), m.PATTERN_W * m.PATTERN_H * 4)
+        row = (m.PATTERN_H // 2) * m.PATTERN_W * 4
+        def px(x):
+            return tuple(data[row + 4 * x: row + 4 * x + 4])
+        self.assertEqual(px(0), (0, 0, 0, 0))
+        self.assertEqual(px(m.PATTERN_BAR - 1), (0, 0, 0, 0))
+        self.assertEqual(px(m.PATTERN_BAR), (255, 0, 0, 255))
+        self.assertEqual(px(m.PATTERN_W - m.PATTERN_BAR), (0, 0, 0, 0))
+        self.assertEqual((m.PATTERN_W - 2 * m.PATTERN_BAR) / m.PATTERN_H, 4 / 3)
+
+    def test_the_pattern_off_a_mac_says_so(self):
+        if sys.platform == "darwin":
+            self.skipTest("this is a Mac")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.mod.pattern(), 2)
+        self.assertIn("macOS", out.getvalue())
+
+    def test_a_server_name_after_the_flag_reads_that_source(self):
+        t = self.mod.check_target
+        self.assertEqual(t(["run.py", "--syphon-check", "ChuuTubePoi-B"]),
+                         "ChuuTubePoi-B")
+        self.assertIsNone(t(["run.py", "--syphon-check"]))
+        self.assertIsNone(t(["run.py", "--syphon-check", "--other"]))
+        source = Path(app_mod.__file__).read_text(encoding="utf-8")
+        self.assertIn("return run_syphon_check(argv)", source)
+
+    def test_the_loopback_also_sends_flipped_like_the_app(self):
+        self.assertIn(("opengl", False), self.mod.LOOPBACKS)
+        self.assertIn(("opengl", True), self.mod.LOOPBACKS)
+        source = Path(self.mod.__file__).read_text(encoding="utf-8")
+        self.assertIn("for server, flipped in LOOPBACKS:", source)
+
+    def test_the_loopback_tries_the_metal_path_the_app_uses(self):
+        self.assertIn(("metal", True), self.mod.LOOPBACKS)
+        source = Path(self.mod.__file__).read_text(encoding="utf-8")
+        self.assertIn("Sender(name, server=server)", source)
+
+    def test_the_pattern_texture_is_complete(self):
+        # 1.0.7: no filters set, so the texture had no usable mipmap level and
+        # macOS sent it as black - "unloadable ... using zero texture".
+        source = Path(self.mod.__file__).read_text(encoding="utf-8")
+        body = source.split("def pattern() -> int:")[1]
+        upload = body.index("GL.glTexImage2D(")
+        self.assertIn("GL.GL_TEXTURE_MIN_FILTER", body[:upload])
+
+    def test_the_pattern_shows_which_way_is_up(self):
+        m = self.mod
+        data = m.pattern_rows()
+        def px(x, y):
+            at = (y * m.PATTERN_W + x) * 4
+            return tuple(data[at: at + 4])
+        mid = m.PATTERN_W // 2
+        self.assertEqual(px(mid, 0), (255, 255, 255, 255))
+        self.assertEqual(px(mid, m.PATTERN_H - 1), (255, 0, 0, 255))
+        self.assertEqual(px(0, 0), (0, 0, 0, 0))
+
+    def test_the_pattern_sends_the_apps_way_too(self):
+        source = Path(self.mod.__file__).read_text(encoding="utf-8")
+        self.assertIn('Sender("ChuuTubePoi-test-App", server="metal")', source)
+        self.assertIn('Sender("ChuuTubePoi-test-OpenGL", server="opengl")',
+                      source)
+
+    def test_the_sender_resets_draw_state_before_every_publish(self):
+        from chuutubepoi import syphon_out
+        calls = []
+        fake = types.SimpleNamespace(SyphonOpenGLServer=_FakeSyphonServer)
+        with mock.patch.object(syphon_out, "syphon", fake), \
+             mock.patch.object(syphon_out, "SYPHON_AVAILABLE", True), \
+             mock.patch.object(syphon_out, "_reset_draw_state",
+                               lambda: calls.append(1)), \
+             mock.patch.object(syphon_out.Sender, "_log_edge",
+                               lambda *a: None):
+            sender = syphon_out.Sender("x", server="opengl")
+            for _ in range(3):
+                sender.send(5, 1920, 1080, True)
+        self.assertEqual(len(calls), 3)
+        body = Path(syphon_out.__file__).read_text(encoding="utf-8").split(
+            "def _reset_draw_state")[1].split("class Sender")[0]
+        for call in ("glDisable(GL.GL_BLEND)", "glDisable(GL.GL_SCISSOR_TEST)",
+                     "glColorMask(GL.GL_TRUE, GL.GL_TRUE, GL.GL_TRUE, GL.GL_TRUE)"):
+            self.assertIn(call, body)
+
+    def test_the_pattern_flag_reaches_it(self):
+        source = Path(app_mod.__file__).read_text(encoding="utf-8")
+        self.assertIn('"--syphon-pattern")):', source)
+        self.assertIn("from .syphoncheck import pattern as run_syphon_pattern",
+                      source)
+
+    def test_the_app_logs_the_edge_once_per_size(self):
+        from chuutubepoi import syphon_out
+        seen = []
+        fake = types.SimpleNamespace(SyphonOpenGLServer=_FakeSyphonServer)
+        with mock.patch.object(syphon_out, "syphon", fake), \
+             mock.patch.object(syphon_out, "SYPHON_AVAILABLE", True), \
+             mock.patch.object(syphon_out.Sender, "_log_edge",
+                               lambda self, t, w, h: seen.append((t, w, h))):
+            sender = syphon_out.Sender("x", server="opengl")
+            for _ in range(3):
+                sender.send(5, 1920, 1080, True)
+            sender.send(6, 1440, 1080, True)
+        self.assertEqual(seen, [(5, 1920, 1080), (6, 1440, 1080)])
+
+
+class _FakeMetalPath:
+    """Stands in for syphon_out._MetalPath."""
+
+    created = []
+    fail_init = False
+    fail_publish = False
+
+    def __init__(self, name):
+        if _FakeMetalPath.fail_init:
+            raise ImportError("No module named 'Metal'")
+        self.name = name
+        self.published = []
+        self.stopped = False
+        _FakeMetalPath.created.append(self)
+
+    def publish(self, texture_id, width, height, flipped):
+        if _FakeMetalPath.fail_publish:
+            raise RuntimeError("Metal would not wrap the IOSurface")
+        self.published.append((texture_id, width, height, flipped))
+
+    def stop(self):
+        self.stopped = True
+
+
+class SyphonMetalPathTests(unittest.TestCase):
+    """1.0.8: frames reach Syphon through our own copy and its Metal server.
+
+    K, 1.0.7: with the OpenGL server a second process read the 4:3 bars with
+    alpha 255 while our texture held 0; Syphon's Metal server kept a test
+    picture's bars transparent in Resolume.
+    """
+
+    def setUp(self):
+        from chuutubepoi import syphon_out
+        self.mod = syphon_out
+        _FakeSyphonServer.created = []
+        _FakeMetalPath.created = []
+        _FakeMetalPath.fail_init = False
+        _FakeMetalPath.fail_publish = False
+        fake = types.SimpleNamespace(SyphonOpenGLServer=_FakeSyphonServer)
+        for name, value in (("syphon", fake), ("SYPHON_AVAILABLE", True),
+                            ("_MetalPath", _FakeMetalPath),
+                            ("_reset_draw_state", lambda: None)):
+            patcher = mock.patch.object(syphon_out, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(syphon_out.Sender, "_log_edge",
+                                    lambda *a: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _send(self, sender, times=1):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            results = [sender.send(7, 1920, 1080, True) for _ in range(times)]
+        return results, err.getvalue()
+
+    def test_metal_is_the_default(self):
+        self.assertEqual(config.SYPHON_SERVER, "metal")
+        self.assertEqual(self.mod.Sender("x").server_kind, config.SYPHON_SERVER)
+
+    def test_the_setting_is_read_and_a_wrong_value_means_metal(self):
+        key = "CHUUTUBEPOI_SYPHON_SERVER"
+        saved = os.environ.get(key)
+        try:
+            for raw, expected in (("opengl", "opengl"), ("OpenGL", "opengl"),
+                                  ("metal", "metal"), ("vulkan", "metal")):
+                with self.subTest(raw):
+                    os.environ[key] = raw
+                    importlib.reload(config)
+                    self.assertEqual(config.SYPHON_SERVER, expected)
+        finally:
+            if saved is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = saved
+            importlib.reload(config)
+
+    def test_frames_go_through_the_metal_path(self):
+        sender = self.mod.Sender("ChuuTubePoi-A", server="metal")
+        results, log = self._send(sender, 3)
+        self.assertEqual(results, [True] * 3)
+        self.assertEqual(len(_FakeMetalPath.created), 1)
+        self.assertEqual(_FakeMetalPath.created[0].published[-1],
+                         (7, 1920, 1080, True))
+        self.assertEqual(_FakeSyphonServer.created, [])
+        self.assertIn("Metal server", log)
+
+    def test_metal_missing_falls_back_to_opengl_and_says_so_once(self):
+        _FakeMetalPath.fail_init = True
+        sender = self.mod.Sender("ChuuTubePoi-A", server="metal")
+        results, log = self._send(sender, 4)
+        self.assertEqual(results, [True] * 4)
+        self.assertEqual(len(_FakeSyphonServer.created), 1)
+        self.assertEqual(log.count("using the OpenGL server"), 1)
+        self.assertEqual(sender.server_kind, "opengl")
+
+    def test_a_metal_failure_mid_session_falls_back_for_good(self):
+        sender = self.mod.Sender("ChuuTubePoi-A", server="metal")
+        self._send(sender)
+        metal = _FakeMetalPath.created[0]
+        _FakeMetalPath.fail_publish = True
+        results, log = self._send(sender, 3)
+        self.assertEqual(results, [False, True, True])
+        self.assertTrue(metal.stopped)
+        self.assertEqual(len(_FakeSyphonServer.created), 1)
+        self.assertEqual(log.count("using the OpenGL server"), 1)
+
+    def test_opengl_can_still_be_chosen(self):
+        sender = self.mod.Sender("ChuuTubePoi-A", server="opengl")
+        self._send(sender)
+        self.assertEqual(_FakeMetalPath.created, [])
+        self.assertEqual(len(_FakeSyphonServer.created), 1)
+
+    def test_release_stops_the_metal_path(self):
+        sender = self.mod.Sender("ChuuTubePoi-A", server="metal")
+        self._send(sender)
+        sender.release()
+        self.assertTrue(_FakeMetalPath.created[0].stopped)
+        self.assertFalse(sender.active)
+
+    def test_the_default_flip_turns_the_copy_over(self):
+        # K, 1.0.9: copied straight, the picture was upside down in Resolume.
+        # With SYPHON_FLIP (the default) the blit now turns it over.
+        self.assertTrue(config.SYPHON_FLIP)
+        self.assertEqual(self.mod.blit_rows(1080, True), (1080, 0))
+        self.assertEqual(self.mod.blit_rows(1080, False), (0, 1080))
+
+    def test_the_copy_is_a_blit_not_a_draw(self):
+        # A blit writes the pixels as they are: no shader, no blending.
+        source = Path(self.mod.__file__).read_text(encoding="utf-8")
+        body = source.split("class _MetalPath:")[1].split("class Sender:")[0]
+        publish = body.split("    def publish(")[1].split("    def _free(")[0]
+        self.assertIn("GL.glBlitFramebuffer(", publish)
+        self.assertIn("GL.GL_NEAREST", publish)
+        self.assertLess(publish.index("glBlitFramebuffer"),
+                        publish.index("_flush()"))
+        self.assertLess(publish.index("_flush()"),
+                        publish.index("publish_frame_texture"))
+
+    def test_two_surfaces_used_in_turn(self):
+        # Metal must never read the surface GL is writing this frame.
+        source = Path(self.mod.__file__).read_text(encoding="utf-8")
+        self.assertIn("SURFACES = 2", source)
+        self.assertIn("self._next = (self._next + 1) % len(self._slots)", source)
+
+    def test_requirements_bring_metal_and_iosurface_on_a_mac(self):
+        reqs = (Path(self.mod.__file__).resolve().parent.parent
+                / "requirements.txt").read_text(encoding="utf-8")
+        for package in ("pyobjc-framework-Metal", "pyobjc-framework-IOSurface"):
+            with self.subTest(package):
+                line = [l for l in reqs.splitlines() if l.startswith(package)]
+                self.assertEqual(len(line), 1)
+                self.assertIn('sys_platform == "darwin"', line[0])
+
+    def test_the_settings_example_and_readme_name_the_fallback(self):
+        root = Path(self.mod.__file__).resolve().parent.parent
+        self.assertIn("#SYPHON_SERVER=opengl",
+                      (root / "settings.txt.example").read_text(encoding="utf-8"))
+        self.assertIn("SYPHON_SERVER=opengl",
+                      (root / "README.md").read_text(encoding="utf-8"))
+
+
+class PlatformOutputTests(unittest.TestCase):
+    """Spout on Windows, Syphon on macOS - picked in one place."""
+
+    def test_macos_gets_syphon(self):
+        from chuutubepoi.syphon_out import SyphonOutput
+        self.assertIsInstance(spout_out.create_output("darwin"), SyphonOutput)
+        self.assertEqual(spout_out.output_kind("darwin"), "Syphon")
+
+    def test_windows_gets_spout(self):
+        self.assertIsInstance(spout_out.create_output("win32"), SpoutOutput)
+        self.assertEqual(spout_out.output_kind("win32"), "Spout")
+
+    def test_the_window_asks_the_factory(self):
+        source = Path(ui_mod.__file__).read_text(encoding="utf-8")
+        self.assertIn("self.spout = create_output()", source)
+        self.assertNotIn("SpoutOutput()", source)
+        self.assertIn('f"{self.spout.kind} out:  "', source)
+
+    def test_the_log_names_the_right_output(self):
+        source = Path(app_mod.__file__).read_text(encoding="utf-8")
+        self.assertIn('f"[chuutube] {kind} canvas:', source)
+        self.assertNotIn('"[chuutube] Spout canvas', source)
+
+
+class PerfLineNamesTheOutputTests(unittest.TestCase):
+    def _line(self, kind):
+        perf = surface_mod.Perf(0.001)
+        perf._t0 -= 1
+        perf.frames = 1
+        perf.add("spout", 0.002)
+        err = io.StringIO()
+        with mock.patch.object(spout_out, "output_kind", lambda: kind), \
+             contextlib.redirect_stderr(err):
+            perf.report()
+        return err.getvalue()
+
+    def test_a_mac_line_says_syphon(self):
+        line = self._line("Syphon")
+        self.assertIn("syphon 2.00ms", line)
+        self.assertNotIn("spout", line)
+
+    def test_a_windows_line_still_says_spout(self):
+        self.assertIn("spout 2.00ms", self._line("Spout"))
+
+
+class GlProfileTests(unittest.TestCase):
+    """macOS gives only GL 2.1 for a compatibility request; ask it for 4.1 core."""
+
+    def test_macos_asks_for_4_1_core(self):
+        self.assertEqual(bootstrap.gl_profile("darwin"), (4, 1, "core"))
+
+    def test_windows_keeps_3_3_compatibility(self):
+        self.assertEqual(bootstrap.gl_profile("win32"), (3, 3, "compatibility"))
+
+    def test_app_and_doctor_use_the_same_choice(self):
+        for module in (app_mod, doctor):
+            source = Path(module.__file__).read_text(encoding="utf-8")
+            with self.subTest(module.__name__):
+                self.assertIn("apply_gl_profile(fmt)", source)
+                self.assertNotIn("fmt.setVersion(3, 3)", source)
+
+    def test_no_gl_call_outside_core_profile(self):
+        # Core profile removed the fixed-function pipeline. One glBegin or
+        # glMatrixMode anywhere and macOS would draw nothing.
+        legacy = ("glBegin", "glEnd(", "glMatrixMode", "glLoadIdentity",
+                  "glVertex", "glTexCoord", "glColor3", "glColor4",
+                  "glPushMatrix",
+                  "glDrawPixels", "GL_QUADS", "glOrtho", "GL_EXTENSIONS")
+        pkg = Path(ui_mod.__file__).resolve().parent
+        for path in pkg.glob("*.py"):
+            source = path.read_text(encoding="utf-8")
+            for name in legacy:
+                with self.subTest(file=path.name, call=name):
+                    self.assertNotIn(name, source)
+
+
+class MacLibmpvSearchTests(unittest.TestCase):
+    """python-mpv must find Homebrew's libmpv.dylib on Apple Silicon too."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="chuutube-dyld-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.brew = self.tmp / "opt-homebrew-lib"
+        self.brew.mkdir()
+        saved = os.environ.get("DYLD_FALLBACK_LIBRARY_PATH")
+        def restore():
+            if saved is None:
+                os.environ.pop("DYLD_FALLBACK_LIBRARY_PATH", None)
+            else:
+                os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = saved
+        self.addCleanup(restore)
+        patcher = mock.patch.object(bootstrap, "HOMEBREW_LIB_DIRS",
+                                    (str(self.brew), str(self.tmp / "absent")))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_homebrew_comes_first_and_dyld_defaults_stay(self):
+        os.environ.pop("DYLD_FALLBACK_LIBRARY_PATH", None)
+        bootstrap._prepare_macos_libs(self.tmp)
+        parts = os.environ["DYLD_FALLBACK_LIBRARY_PATH"].split(os.pathsep)
+        self.assertEqual(parts[0], str(self.brew))
+        self.assertIn("/usr/local/lib", parts)
+        self.assertIn("/usr/lib", parts)
+        self.assertNotIn(str(self.tmp / "absent"), parts)
+
+    def test_an_existing_value_is_kept(self):
+        os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = "/somewhere/else"
+        bootstrap._prepare_macos_libs(self.tmp)
+        parts = os.environ["DYLD_FALLBACK_LIBRARY_PATH"].split(os.pathsep)
+        self.assertEqual(parts[-1], "/somewhere/else")
+
+    def test_the_help_text_on_a_mac_says_brew(self):
+        with mock.patch.object(bootstrap.sys, "platform", "darwin"):
+            text = bootstrap.mpv_import_error_help(OSError("x"))
+        self.assertIn("brew install mpv", text)
+
+
+class AppNapTests(unittest.TestCase):
+    """macOS must not slow the render timer while Resolume is in front."""
+
+    def setUp(self):
+        from chuutubepoi import macos
+        self.mod = macos
+        self.calls = []
+        calls = self.calls
+
+        class _Info:
+            def beginActivityWithOptions_reason_(self, options, reason):
+                calls.append((options, reason))
+                return "activity"
+        patcher = mock.patch.object(macos, "_process_info", lambda: _Info())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_nothing_happens_off_a_mac(self):
+        self.assertIsNone(self.mod.keep_awake("win32"))
+        self.assertEqual(self.calls, [])
+
+    def test_on_a_mac_an_activity_is_held(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.mod.keep_awake("darwin"), "activity")
+        options, reason = self.calls[0]
+        self.assertTrue(options & self.mod.NS_ACTIVITY_LATENCY_CRITICAL
+                        == self.mod.NS_ACTIVITY_LATENCY_CRITICAL)
+        self.assertTrue(options & 0x00FFFFFF == 0x00FFFFFF, "user-initiated")
+        self.assertEqual(self.mod.NS_ACTIVITY_LATENCY_CRITICAL, 0xFF00000000)
+
+    def test_a_failure_costs_smoothness_not_the_window(self):
+        with mock.patch.object(self.mod, "_process_info",
+                               lambda: (_ for _ in ()).throw(ImportError("no pyobjc"))):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertIsNone(self.mod.keep_awake("darwin"))
+        self.assertIn("App Nap", err.getvalue())
+
+    def test_the_app_holds_it_until_exit(self):
+        source = Path(app_mod.__file__).read_text(encoding="utf-8")
+        body = source.split("window = MainWindow()")[-1]
+        self.assertLess(body.index("_activity = keep_awake()"),
+                        body.index("return leave(app.exec())"))
+
+
+class MacRequirementsTests(unittest.TestCase):
+    def _lines(self):
+        path = Path(__file__).resolve().parent.parent / "requirements.txt"
+        return [l.strip() for l in path.read_text(encoding="utf-8").splitlines()
+                if l.strip() and not l.strip().startswith("#")]
+
+    def test_each_platform_gets_only_its_own_output(self):
+        lines = self._lines()
+        spout = [l for l in lines if l.startswith("SpoutGL")]
+        syphon = [l for l in lines if l.startswith("syphon-python")]
+        self.assertEqual(len(spout), 1)
+        self.assertEqual(len(syphon), 1)
+        self.assertIn('sys_platform == "win32"', spout[0])
+        self.assertIn('sys_platform == "darwin"', syphon[0])
+        self.assertIn("[opengl]", syphon[0])
+
+    def test_pyobjc_only_on_a_mac(self):
+        cocoa = [l for l in self._lines() if l.startswith("pyobjc")]
+        self.assertTrue(cocoa)
+        for line in cocoa:
+            self.assertIn('sys_platform == "darwin"', line)
+
+
+class SetupShTests(unittest.TestCase):
+    """setup.sh, the macOS setup. Its helpers run here in bash; main() does not."""
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def _script(self) -> str:
+        return (self.ROOT / "setup.sh").read_text(encoding="utf-8")
+
+    def _bash(self, body: str, venv_py: str = sys.executable):
+        if not shutil.which("bash"):
+            self.skipTest("no bash on this machine")
+        prelude = (f"CHUUTUBE_SETUP_SOURCE_ONLY=1; . {shlex.quote(str(self.ROOT / 'setup.sh'))}; "
+                   f"set +e; VENV_PY={shlex.quote(venv_py)}; ")
+        return subprocess.run(["bash", "-c", prelude + body],
+                              capture_output=True, text=True, timeout=60)
+
+    # --- pins shared with Windows -------------------------------------------
+    def test_the_same_node_release_as_setup_ps1(self):
+        mac = re.search(r'^NODE_VERSION="([^"]+)"', self._script(), re.M).group(1)
+        ps1 = (self.ROOT / "setup.ps1").read_text(encoding="utf-8")
+        win = re.search(r'Node\s*=\s*@\{\s*Version = "([^"]+)"', ps1).group(1)
+        self.assertEqual(mac, win)
+
+    def test_both_mac_tarballs_have_a_checksum(self):
+        sums = (self.ROOT / "checksums.txt").read_text(encoding="utf-8")
+        mac = re.search(r'^NODE_VERSION="([^"]+)"', self._script(), re.M).group(1)
+        for arch in ("arm64", "x64"):
+            with self.subTest(arch):
+                self.assertRegex(sums, rf"(?m)^[0-9a-f]{{64}}\s+node-v{re.escape(mac)}"
+                                       rf"-darwin-{arch}\.tar\.gz$")
+
+    def test_npm_runs_as_in_the_app_and_on_windows(self):
+        app = " ".join(potprovider.npm_ci_command("node", "npm")[2:])
+        self.assertIn(f'"$1" "$2" {app}', self._script())
+
+    def test_python_versions_match_syphon_python(self):
+        self.assertIn("3.10|3.11|3.12|3.13|3.14)", self._script())
+
+    def test_runs_on_the_bash_macos_ships(self):
+        script = self._script()
+        code = "\n".join(line for line in script.splitlines()
+                         if not line.lstrip().startswith("#"))
+        for newer in ("declare -A", "mapfile", "readarray", ",,}", "^^}", "|&",
+                      "local -n", "realpath "):
+            with self.subTest(newer):
+                self.assertNotIn(newer, code)
+        self.assertNotIn("\r\n", script)
+        self.assertTrue(script.startswith("#!/bin/bash\n"))
+
+    def test_main_refuses_anything_but_macos(self):
+        if sys.platform == "darwin":
+            self.skipTest("this is a Mac")
+        if not shutil.which("bash"):
+            self.skipTest("no bash on this machine")
+        done = subprocess.run(["bash", str(self.ROOT / "setup.sh")],
+                              capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("for macOS", done.stderr)
+
+    # --- the helpers, run for real ------------------------------------------
+    def test_a_file_without_a_checksum_is_refused(self):
+        done = self._bash("(fetch_verified https://nodejs.org/x /dev/null nope.zip); echo rc=$?")
+        self.assertIn("not listed in checksums.txt", done.stderr)
+        self.assertIn("rc=1", done.stdout)
+
+    def test_only_the_allowed_hosts(self):
+        done = self._bash(
+            "for u in https://nodejs.org/dist/a https://github.com/a "
+            "http://nodejs.org/a https://evil.example/a file:///etc/passwd "
+            "https://nodejs.org.evil.example/a; do "
+            "trusted_url \"$u\" && echo \"yes $u\" || echo \"no $u\"; done")
+        self.assertIn("yes https://nodejs.org/dist/a", done.stdout)
+        self.assertIn("yes https://github.com/a", done.stdout)
+        for bad in ("http://nodejs.org/a", "https://evil.example/a",
+                    "file:///etc/passwd", "https://nodejs.org.evil.example/a"):
+            self.assertIn(f"no {bad}", done.stdout)
+
+    def test_archive_names_that_leave_the_folder(self):
+        done = self._bash(r"printf 'a/b\n../x\n/abs\nok/..x/y\nc/../d\nnode-v1/bin/node\n' | unsafe_entries")
+        self.assertEqual(done.stdout.split(), ["../x", "/abs", "c/../d"])
+
+    def test_links_inside_are_kept_and_links_out_are_found(self):
+        tmp = Path(tempfile.mkdtemp(prefix="chuutube-links-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / "lib").mkdir()
+        (tmp / "lib" / "npm-cli.js").write_text("", encoding="utf-8")
+        (tmp / "bin").mkdir()
+        try:
+            os.symlink("../lib/npm-cli.js", tmp / "bin" / "npm")
+            os.symlink("/etc/passwd", tmp / "bin" / "evil")
+        except (OSError, NotImplementedError):
+            self.skipTest("cannot make symlinks here")
+        done = self._bash(f"links_escaping {shlex.quote(str(tmp))}")
+        self.assertIn("evil", done.stdout)
+        self.assertNotIn("npm", done.stdout)
+
+    def test_the_tarball_for_each_processor(self):
+        done = self._bash("node_tarball_name arm64; node_tarball_name x86_64; "
+                          "node_tarball_name ppc || echo none")
+        lines = done.stdout.split()
+        self.assertTrue(lines[0].endswith("-darwin-arm64.tar.gz"))
+        self.assertTrue(lines[1].endswith("-darwin-x64.tar.gz"))
+        self.assertEqual(lines[2], "none")
+
+    def test_the_checksum_lookup_skips_comments(self):
+        done = self._bash("expected_hash bgutil-ytdlp-pot-provider-2.0.0.zip")
+        self.assertRegex(done.stdout.strip(), r"^[0-9a-f]{64}$")
+
+
+class SetupShRuntimeOnlyTests(unittest.TestCase):
+    """setup.sh --runtime-only: what the macOS app runs on its first start."""
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def _script(self) -> str:
+        return (self.ROOT / "setup.sh").read_text(encoding="utf-8")
+
+    def _bash(self, body: str, env=None):
+        if not shutil.which("bash"):
+            self.skipTest("no bash on this machine")
+        prelude = (f"CHUUTUBE_SETUP_SOURCE_ONLY=1; . {shlex.quote(str(self.ROOT / 'setup.sh'))}; "
+                   "set +e; ")
+        full = dict(os.environ)
+        full.update(env or {})
+        return subprocess.run(["bash", "-c", prelude + body], env=full,
+                              capture_output=True, text=True, timeout=60)
+
+    def test_it_installs_where_the_app_says_and_reads_the_bundle(self):
+        res = Path(tempfile.mkdtemp(prefix="chuutube-res-"))
+        self.addCleanup(shutil.rmtree, res, True)
+        (res / "checksums.txt").write_text("a" * 64 + "  only-here.zip\n",
+                                           encoding="utf-8")
+        done = self._bash('echo "root=$ROOT"; expected_hash only-here.zip',
+                          env={"CHUUTUBE_ROOT": "/tmp/chuutube-data",
+                               "CHUUTUBE_RESOURCES": str(res)})
+        self.assertIn("root=/tmp/chuutube-data", done.stdout)
+        self.assertIn("a" * 64, done.stdout)
+
+    def test_from_source_both_are_this_folder(self):
+        done = self._bash('echo "$ROOT|$RES"',
+                          env={"CHUUTUBE_ROOT": "", "CHUUTUBE_RESOURCES": ""})
+        root, res = done.stdout.strip().split("|")
+        # By name: bash on Windows spells the folder its own way (/d/...).
+        self.assertEqual(root, res)
+        self.assertEqual(root.rstrip("/").rsplit("/", 1)[-1], self.ROOT.name)
+
+    def test_runtime_only_skips_python(self):
+        main = self._script().split("main() {")[1].split("\n}\n")[0]
+        self.assertIn('[ "${1:-}" = "--runtime-only" ] && runtime_only=1', main)
+        self.assertIn("setup_python", main.split("else")[1])
+        runtime = self._script().split("setup_runtime() {")[1]
+        self.assertIn("CHUUTUBE_PLUGIN_VERSION", runtime)
+        self.assertNotIn("-m pip", runtime)
+
+    def test_the_settings_template_comes_from_the_bundle(self):
+        self.assertIn('cp "$RES/settings.txt.example" "$ROOT/settings.txt"',
+                      self._script())
+
+    def test_brew_is_found_without_it_on_path(self):
+        # An app started from the Finder has only /usr/bin:/bin on PATH.
+        body = self._script().split("find_brew() {")[1].split("\n}\n")[0]
+        self.assertIn("/opt/homebrew/bin/brew", body)
+        self.assertIn("/usr/local/bin/brew", body)
+        self.assertIn('"$brew" install mpv', self._script())
+
+    def test_links_need_no_python(self):
+        body = self._script().split("links_escaping() {")[1].split("\n}\n")[0]
+        self.assertNotIn("VENV_PY", body)
+        self.assertNotIn("python", body.lower().replace("no python", ""))
+
+    def test_links_to_dot_dot_and_to_nothing_are_refused(self):
+        tmp = Path(tempfile.mkdtemp(prefix="chuutube-links2-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / "a" / "b").mkdir(parents=True)
+        (tmp / "a" / "file").write_text("", encoding="utf-8")
+        try:
+            os.symlink("..", tmp / "a" / "up-inside")         # -> tmp: inside
+            os.symlink("../..", tmp / "a" / "up-out")          # -> above tmp
+            os.symlink("../file", tmp / "a" / "b" / "ok")      # inside
+            os.symlink("missing/x", tmp / "a" / "dangling")    # nowhere
+            os.symlink("..", tmp / "top-up")                   # above tmp
+        except (OSError, NotImplementedError):
+            self.skipTest("cannot make symlinks here")
+        done = self._bash(f"links_escaping {shlex.quote(str(tmp))}")
+        out = done.stdout
+        self.assertIn("up-out", out)
+        self.assertIn("dangling", out)
+        self.assertIn("top-up", out)
+        self.assertNotIn("up-inside", out)
+        self.assertNotIn("/ok", out)
+
+
+class AppIconTests(unittest.TestCase):
+    """The ChuuTubePoi icon (K, 1.1): in the windows, the exe and the Mac app."""
+
+    def test_the_files_are_there_in_every_size(self):
+        # Read from the file headers: Pillow is not in the app's venv.
+        import struct
+        png = (ROOT / "assets" / "icon.png").read_bytes()
+        self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertEqual(struct.unpack(">II", png[16:24]), (1024, 1024))
+        ico = (ROOT / "assets" / "ChuuTubePoi.ico").read_bytes()
+        self.assertEqual(ico[:4], b"\x00\x00\x01\x00")
+        count = struct.unpack("<H", ico[4:6])[0]
+        sizes = sorted((ico[6 + 16 * i] or 256) for i in range(count))
+        self.assertEqual(sizes, [16, 24, 32, 48, 64, 128, 256])
+        icns = (ROOT / "assets" / "ChuuTubePoi.icns").read_bytes()
+        self.assertEqual(icns[:4], b"icns")
+        self.assertEqual(struct.unpack(">I", icns[4:8])[0], len(icns))
+
+    def test_found_from_source(self):
+        self.assertEqual(bootstrap.icon_file(), ROOT / "assets" / "icon.png")
+
+    def test_found_in_a_build(self):
+        bundle = Path(tempfile.mkdtemp(prefix="chuutube-bundle-"))
+        self.addCleanup(shutil.rmtree, bundle, True)
+        (bundle / "assets").mkdir()
+        (bundle / "assets" / "icon.png").write_bytes(b"png")
+        with mock.patch.object(sys, "frozen", True, create=True), \
+             mock.patch.object(sys, "_MEIPASS", str(bundle), create=True):
+            self.assertEqual(bootstrap.icon_file(), bundle / "assets" / "icon.png")
+
+    def test_the_app_sets_it(self):
+        source = Path(app_mod.__file__).read_text(encoding="utf-8")
+        self.assertIn("app.setWindowIcon(QIcon(str(icon)))", source)
+        self.assertLess(source.index("app = QApplication(argv)"),
+                        source.index("app.setWindowIcon("))
+
+    def test_both_builds_carry_it(self):
+        ps1 = (ROOT / "build.ps1").read_text(encoding="utf-8")
+        self.assertIn('"--icon", (Join-Path $Root "assets\\ChuuTubePoi.ico")', ps1)
+        self.assertIn('(Join-Path $Root "assets\\icon.png") + ";assets"', ps1)
+        mac = (ROOT / "build-mac.sh").read_text(encoding="utf-8")
+        self.assertIn("--icon\n$ROOT/assets/ChuuTubePoi.icns", mac)
+        self.assertIn("--add-data\n$ROOT/assets/icon.png:assets", mac)
+
+
+class CollectLicensesTests(unittest.TestCase):
+    """collect_licenses.py: licences for the Mac zip (1.1, setup.sh --licenses)."""
+
+    def setUp(self):
+        import importlib.util
+        path = ROOT / "collect_licenses.py"
+        spec = importlib.util.spec_from_file_location("collect_licenses", path)
+        self.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.mod)
+        self.tmp = Path(tempfile.mkdtemp(prefix="chuutube-lic-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.site = self.tmp / "site-packages"
+        self.out = self.tmp / "licenses"
+        self.site.mkdir()
+
+    def _dist(self, name, version, meta_extra="", files=None):
+        d = self.site / f"{name.replace('-', '_')}-{version}.dist-info"
+        d.mkdir()
+        (d / "METADATA").write_text(
+            f"Metadata-Version: 2.4\nName: {name}\nVersion: {version}\n"
+            f"{meta_extra}\nThe long description. License: not a header\n",
+            encoding="utf-8")
+        for rel, text in (files or {}).items():
+            (d / rel).parent.mkdir(parents=True, exist_ok=True)
+            (d / rel).write_text(text, encoding="utf-8")
+        return d
+
+    def test_texts_from_both_places_and_the_inventory(self):
+        self._dist("syphon-python", "0.2.0", "License-Expression: MIT",
+                   {"licenses/LICENSE": "MIT text"})
+        self._dist("PySide6", "6.12.0",
+                   "Classifier: License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)",
+                   {"LICENSE.LGPLv3": "LGPL text"})
+        self._dist("bgutil-ytdlp-pot-provider", "2.0.0", "License: GPL-3.0")
+        native = [("Syphon framework", "https://raw.githubusercontent.com/x")]
+        (self.out).mkdir()
+        (self.out / "Syphon-framework.txt").write_text("BSD", encoding="utf-8")
+        found = self.mod.collect(self.out, self.site, native, today="2026-11-12")
+        self.assertEqual(found["packages"], 3)
+        self.assertEqual(found["missing"], ["bgutil-ytdlp-pot-provider 2.0.0"])
+        self.assertEqual(found["native_missing"], [])
+        self.assertIn("MIT text",
+                      (self.out / "syphon-python-0.2.0.txt").read_text(encoding="utf-8"))
+        self.assertIn("LGPL text",
+                      (self.out / "PySide6-6.12.0.txt").read_text(encoding="utf-8"))
+        inv = (self.out / "INVENTORY.md").read_text(encoding="utf-8")
+        self.assertIn("| syphon-python | 0.2.0 | MIT | `syphon-python-0.2.0.txt` |", inv)
+        self.assertIn("GNU Lesser General Public License v3", inv)
+        self.assertIn("| bgutil-ytdlp-pot-provider | 2.0.0 | GPL-3.0 | **none shipped** |", inv)
+        self.assertIn("| Syphon framework | `Syphon-framework.txt` |", inv)
+        self.assertIn("## Shipped no licence text", inv)
+        self.assertIn("2026-11-12", inv)
+
+    def test_a_text_fetched_by_hand_counts(self):
+        self._dist("PyOpenGL", "3.1.10", "License: BSD")
+        self.out.mkdir()
+        (self.out / "PyOpenGL.txt").write_text("compound", encoding="utf-8")
+        found = self.mod.collect(self.out, self.site, [])
+        self.assertEqual(found["missing"], [])
+        inv = (self.out / "INVENTORY.md").read_text(encoding="utf-8")
+        self.assertIn("`PyOpenGL.txt` (from the project)", inv)
+
+    def test_a_project_text_is_listed_beside_the_wheels(self):
+        # The PySide6 wheels for Windows carry only the Qt commercial notice;
+        # the LGPL text the app relies on comes from the project (1.1).
+        self._dist("PySide6", "6.12.0", "License-Expression: LGPL-3.0-only",
+                   {"licenses/LicenseRef-Qt-Commercial.txt": "commercial"})
+        self.out.mkdir()
+        (self.out / "PySide6.txt").write_text("LGPL", encoding="utf-8")
+        found = self.mod.collect(self.out, self.site, [])
+        self.assertEqual(found["missing"], [])
+        inv = (self.out / "INVENTORY.md").read_text(encoding="utf-8")
+        self.assertIn("`PySide6-6.12.0.txt`, `PySide6.txt` (from the project)", inv)
+
+    def test_setup_sh_fetches_every_text_the_mac_wheels_lack(self):
+        # Exactly the list from the tester's first INVENTORY.md (1.1), under
+        # the names pip uses, so collect_licenses.py finds the files.
+        script = (ROOT / "setup.sh").read_text(encoding="utf-8")
+        listed = script.split('PACKAGE_LICENSES="')[1].split('"')[0]
+        names = [line.split("=")[0] for line in listed.splitlines()]
+        for name in ("bgutil-ytdlp-pot-provider", "pyobjc-core",
+                     "pyobjc-framework-IOSurface", "pyobjc-framework-Metal",
+                     "PyOpenGL", "PySide6", "PySide6_Addons",
+                     "PySide6_Essentials", "PySide6_Pdf", "PySide6_WebEngine",
+                     "shiboken6"):
+            self.assertIn(name, names)
+        self.assertIn("LGPL-3.0-only.txt", script.split("QT_LGPL=")[1].splitlines()[0])
+        body = script.split("licenses() {")[1].split("\n}\n")[0]
+        self.assertIn('fetch_text "$name" "$url" "$dir/$name.txt"', body)
+        fetch = script.split("fetch_text() {")[1].split("\n}\n")[0]
+        self.assertIn('[ -f "$out" ] && return 0', fetch)
+        self.assertIn("https://raw.githubusercontent.com/*", fetch)
+
+    def test_a_missing_native_text_is_reported(self):
+        found = self.mod.collect(self.out, self.site,
+                                 [("Node.js", "https://raw.githubusercontent.com/n")])
+        self.assertEqual(found["native_missing"], ["Node.js"])
+        self.assertIn("| Node.js | **missing** |",
+                      (self.out / "INVENTORY.md").read_text(encoding="utf-8"))
+
+    def test_the_headers_end_at_the_first_blank_line(self):
+        # "License:" inside the description must not be read as the licence.
+        d = self._dist("x", "1.0")
+        info = self.mod.read_dist(d)
+        self.assertEqual(info["expression"], "")
+
+    def test_main_fails_while_anything_is_missing(self):
+        self._dist("a", "1", "License-Expression: MIT", {"LICENSE": "t"})
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.mod.main([str(self.out), str(self.site)]), 0)
+            self.assertEqual(self.mod.main([str(self.out), str(self.site),
+                                            "Node.js=https://x"]), 1)
+
+    def test_setup_sh_runs_it_and_names_the_native_texts(self):
+        script = (ROOT / "setup.sh").read_text(encoding="utf-8")
+        body = script.split("licenses() {")[1].split("\n}\n")[0]
+        self.assertIn('"$VENV_PY" "$ROOT/collect_licenses.py" "$dir" "$site"', body)
+        natives = script.split('NATIVE_LICENSES="')[1].split('"')[0]
+        for name in ("libmpv (mpv)", "Node.js", "Syphon framework"):
+            self.assertIn(name + "=https://raw.githubusercontent.com/", natives)
+        main = script.split("main() {")[1].split("\n}\n")[0]
+        self.assertIn('if [ "${1:-}" = "--licenses" ]; then', main)
+
+    def test_the_mac_zip_says_when_it_has_no_licence_texts(self):
+        build = (ROOT / "build-mac.sh").read_text(encoding="utf-8")
+        main = build.split("main() {")[1]
+        self.assertIn('ls "$stage/licenses/"*.txt', main)
+        self.assertIn("bash setup.sh --licenses", build)
+        self.assertIn('LSMinimumSystemVersion -string "14.0"', build)
+
+
+class BuildMacTests(unittest.TestCase):
+    """build-mac.sh, the macOS app build. Its parts run here; main() does not."""
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def _script(self) -> str:
+        return (self.ROOT / "build-mac.sh").read_text(encoding="utf-8")
+
+    def _bash(self, body: str):
+        if not shutil.which("bash"):
+            self.skipTest("no bash on this machine")
+        prelude = (f"CHUUTUBE_BUILD_SOURCE_ONLY=1; . {shlex.quote(str(self.ROOT / 'build-mac.sh'))}; "
+                   "set +e; ")
+        return subprocess.run(["bash", "-c", prelude + body],
+                              capture_output=True, text=True, timeout=60)
+
+    def test_it_parses(self):
+        if not shutil.which("bash"):
+            self.skipTest("no bash on this machine")
+        done = subprocess.run(["bash", "-n", str(self.ROOT / "build-mac.sh")],
+                              capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_runs_on_the_bash_macos_ships(self):
+        script = self._script()
+        code = "\n".join(l for l in script.splitlines()
+                         if not l.lstrip().startswith("#"))
+        for newer in ("declare -A", "mapfile", "readarray", ",,}", "^^}",
+                      "|&", "local -n", "realpath "):
+            with self.subTest(newer):
+                self.assertNotIn(newer, code)
+        self.assertNotIn("\r\n", script)
+        self.assertTrue(script.startswith("#!/bin/bash\n"))
+
+    def test_main_refuses_anything_but_macos(self):
+        if sys.platform == "darwin":
+            self.skipTest("this is a Mac")
+        if not shutil.which("bash"):
+            self.skipTest("no bash on this machine")
+        done = subprocess.run(["bash", str(self.ROOT / "build-mac.sh")],
+                              capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("for macOS", done.stderr)
+
+    def test_the_app_carries_what_the_first_start_needs(self):
+        done = self._bash("pyinstaller_args")
+        # The folder as bash spells it (on Windows: /d/...).
+        root = self._bash('echo "$ROOT"').stdout.strip()
+        args = done.stdout.splitlines()
+        for flag, value in (("--add-data", f"{root}/setup.sh:."),
+                            ("--add-data", f"{root}/checksums.txt:."),
+                            ("--add-data", f"{root}/settings.txt.example:."),
+                            ("--collect-all", "syphon"),
+                            ("--collect-all", "Metal"),
+                            ("--collect-all", "IOSurface"),
+                            ("--collect-all", "yt_dlp"),
+                            ("--collect-all", "bgutil_ytdlp_pot_provider")):
+            with self.subTest(value):
+                pairs = list(zip(args, args[1:]))
+                self.assertIn((flag, value), pairs)
+        self.assertIn("--windowed", args)
+        self.assertIn("--onedir", args)
+        self.assertEqual(args[-1], f"{root}/run.py")
+
+    def test_what_must_not_ship_is_found(self):
+        if sys.platform == "win32":
+            self.skipTest("compares paths as bash prints them")
+        app = Path(tempfile.mkdtemp(prefix="chuutube-app-")) / "X.app"
+        self.addCleanup(shutil.rmtree, app.parent, True)
+        res = app / "Contents" / "Resources"
+        deep = app / "Contents" / "Frameworks" / "pkg" / "sub" / "node"
+        deep.mkdir(parents=True)
+        res.mkdir(parents=True)
+        for name in ("settings.txt", "settings.txt.example", "libmpv.2.dylib"):
+            (res / name).write_text("", encoding="utf-8")
+        (res / "node").mkdir()
+        (res / "logs").mkdir()
+        done = self._bash(f"forbidden_in {shlex.quote(str(app))}")
+        found = done.stdout.splitlines()
+        self.assertIn(str(res / "settings.txt"), found)
+        self.assertIn(str(res / "libmpv.2.dylib"), found)
+        self.assertIn(str(res / "node"), found)
+        self.assertIn(str(res / "logs"), found)
+        self.assertNotIn(str(res / "settings.txt.example"), found)
+        self.assertNotIn(str(deep), found, "a package's own folder")
+
+    def _flat_framework(self, at: Path, binary=True, current=True):
+        """A framework as a wheel holds it: every link is a real folder.
+
+        A wheel cannot hold links, so syphon-python's Syphon.framework is
+        like this in the venv already, and PyInstaller copies it as it is.
+        """
+        tops = ["Versions/A"] + (["Versions/Current"] if current else []) + [""]
+        for top in tops:
+            (at / top / "Resources").mkdir(parents=True, exist_ok=True)
+            (at / top / "Resources" / "Info.plist").write_text("plist")
+            if binary:
+                (at / top / "Syphon").write_text("code")
+        (at / "Headers").mkdir()
+        (at / "Headers" / "Syphon.h").write_text("only at the top")
+
+    def _good_framework(self, at: Path):
+        (at / "Versions" / "A" / "Resources").mkdir(parents=True)
+        (at / "Versions" / "A" / "Resources" / "Info.plist").write_text("x")
+        (at / "Versions" / "A" / "QtCore").write_text("qt")
+        os.symlink("A", at / "Versions" / "Current")
+        os.symlink("Versions/Current/QtCore", at / "QtCore")
+        os.symlink("Versions/Current/Resources", at / "Resources")
+
+    def _app(self):
+        if sys.platform == "win32":
+            self.skipTest("needs symlinks and paths as bash prints them")
+        tmp = Path(tempfile.mkdtemp(prefix="chuutube-fw-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        app = tmp / "X.app"
+        try:
+            self._good_framework(app / "Contents" / "Frameworks" / "PySide6"
+                                 / "Qt" / "lib" / "QtCore.framework")
+        except (OSError, NotImplementedError):
+            self.skipTest("cannot make symlinks here")
+        return app
+
+    SYPHON = Path("syphon") / "libs" / "Syphon.framework"
+
+    def test_a_framework_copied_flat_is_found_a_whole_one_is_not(self):
+        app = self._app()
+        flat = app / "Contents" / "Frameworks" / self.SYPHON
+        self._flat_framework(flat)
+        done = self._bash(f"broken_frameworks {shlex.quote(str(app))}")
+        self.assertEqual(done.stdout.split(), [str(flat)])
+
+    def _repaired(self, flat):
+        self.assertTrue((flat / "Versions" / "Current").is_symlink())
+        self.assertEqual(os.readlink(flat / "Versions" / "Current"), "A")
+        for name in ("Syphon", "Resources", "Headers"):
+            with self.subTest(name):
+                self.assertTrue((flat / name).is_symlink())
+                self.assertEqual(os.readlink(flat / name),
+                                 f"Versions/Current/{name}")
+        self.assertEqual((flat / "Syphon").read_text(), "code")
+        self.assertEqual((flat / "Resources" / "Info.plist").read_text(),
+                         "plist")
+        # What existed only at the top level was moved in, not lost.
+        self.assertEqual((flat / "Versions" / "A" / "Headers"
+                          / "Syphon.h").read_text(), "only at the top")
+        tops = sorted(x.name for x in flat.iterdir())
+        self.assertEqual(tops, ["Headers", "Resources", "Syphon", "Versions"])
+
+    def test_it_gets_its_links_back_in_place(self):
+        app = self._app()
+        flat = app / "Contents" / "Frameworks" / self.SYPHON
+        self._flat_framework(flat)
+        done = self._bash(f"repair_frameworks {shlex.quote(str(app))}; echo rc=$?")
+        self.assertEqual(done.stdout.split(), [str(flat), "rc=0"], done.stderr)
+        self._repaired(flat)
+        again = self._bash(f"broken_frameworks {shlex.quote(str(app))}")
+        self.assertEqual(again.stdout.strip(), "")
+        # Qt's, already whole, was left alone.
+        qt = app / "Contents" / "Frameworks" / "PySide6" / "Qt" / "lib" / "QtCore.framework"
+        self.assertEqual((qt / "QtCore").read_text(), "qt")
+
+    def test_a_framework_with_only_a_current_folder_is_repaired_too(self):
+        app = self._app()
+        flat = app / "Contents" / "Frameworks" / self.SYPHON
+        self._flat_framework(flat)
+        shutil.rmtree(flat / "Versions" / "A")
+        done = self._bash(f"repair_frameworks {shlex.quote(str(app))}; echo rc=$?")
+        self.assertEqual(done.stdout.split(), [str(flat), "rc=0"], done.stderr)
+        self._repaired(flat)
+
+    def test_and_one_without_a_current_folder(self):
+        app = self._app()
+        flat = app / "Contents" / "Frameworks" / self.SYPHON
+        self._flat_framework(flat, current=False)
+        done = self._bash(f"repair_frameworks {shlex.quote(str(app))}; echo rc=$?")
+        self.assertEqual(done.stdout.split(), [str(flat), "rc=0"], done.stderr)
+        self._repaired(flat)
+
+    def test_a_partial_copy_under_resources_becomes_a_link_to_the_whole_one(self):
+        app = self._app()
+        whole = app / "Contents" / "Frameworks" / self.SYPHON
+        part = app / "Contents" / "Resources" / self.SYPHON
+        self._flat_framework(whole)
+        self._flat_framework(part, binary=False)
+        done = self._bash(f"repair_frameworks {shlex.quote(str(app))}; echo rc=$?")
+        self.assertEqual(done.stdout.split(), [str(whole), "rc=0"], done.stderr)
+        self.assertTrue(part.is_symlink())
+        self.assertEqual(os.readlink(part),
+                         "../../../Frameworks/syphon/libs/Syphon.framework")
+        self.assertEqual((part / "Syphon").read_text(), "code")
+
+    def test_the_repair_does_not_look_for_an_original(self):
+        # Tester, 1.1: the venv's copy is as flat as the app's - copying it
+        # over changed nothing, and the build stopped "still broken".
+        body = self._script().split("repair_frameworks() {")[1].split("\n}\n")[0]
+        self.assertNotIn("site", body.replace("opposite", ""))
+        self.assertNotIn("restore_frameworks", self._script())
+
+    def test_frameworks_are_repaired_before_anything_is_signed(self):
+        main = self._script().split("main() {")[1]
+        self.assertLess(main.index('repair_frameworks "$APP"'),
+                        main.index("codesign --force"))
+        self.assertLess(main.index('codesign --force --sign "$SIGN_ID" "$fw"'),
+                        main.index('codesign --force --deep --sign "$SIGN_ID" "$APP"'))
+
+    def test_long_output_goes_to_a_log_and_a_failure_shows_its_end(self):
+        tmp = Path(tempfile.mkdtemp(prefix="chuutube-buildlog-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        log = tmp / "build.log"
+        log.write_text("earlier\n", encoding="utf-8")
+        q = shlex.quote(str(log))
+        ok = self._bash(f"LOG={q}; logged 'Quiet step' "
+                        "bash -c 'echo fine; echo also >&2'; echo rc=$?")
+        self.assertEqual(ok.stdout.strip(), "rc=0")
+        self.assertEqual(ok.stderr.strip(), "")
+        text = log.read_text(encoding="utf-8")
+        self.assertIn("===== Quiet step =====", text)
+        self.assertIn("fine", text)
+        self.assertIn("also", text)
+        bad = self._bash(f"LOG={q}; logged 'Loud step' "
+                         "bash -c 'echo the reason; exit 3'; echo rc=$?")
+        self.assertEqual(bad.stdout.strip(), "rc=1")
+        self.assertIn("Loud step failed", bad.stderr)
+        self.assertIn("the reason", bad.stderr)
+        self.assertNotIn("fine", bad.stderr, "only the failed step's output")
+        self.assertIn(str(log), bad.stderr)
+
+    def test_the_tests_and_pyinstaller_are_logged_not_printed(self):
+        main = self._script().split("main() {")[1]
+        self.assertIn('logged "The tests" "$VENV_PY" -m unittest discover', main)
+        self.assertIn('logged "PyInstaller" "$VENV_PY" -m PyInstaller', main)
+        self.assertLess(main.index(': >"$LOG"'), main.index('logged "The tests"'))
+        ignore = (self.ROOT / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn("build-mac.log", ignore.splitlines())
+
+    def _fake_xcode(self, version: str) -> Path:
+        # A developer folder with an actool that answers --version like the
+        # real one and otherwise writes its arguments and an Assets.car.
+        dev = Path(tempfile.mkdtemp(prefix="chuutube-xcode-")) / "Contents" / "Developer"
+        self.addCleanup(shutil.rmtree, dev.parent.parent, True)
+        tool = dev / "usr" / "bin" / "actool"
+        tool.parent.mkdir(parents=True)
+        tool.write_text(
+            "#!/bin/bash\n"
+            'if [ "$1" = "--version" ]; then\n'
+            "  echo '/* com.apple.actool.version */'\n"
+            "  echo 'bundle-version: 24127'\n"
+            f"  echo 'short-bundle-version: {version}'\n"
+            "  exit 0\n"
+            "fi\n"
+            'echo "DEVELOPER_DIR=$DEVELOPER_DIR" > "$(dirname "$0")/args"\n'
+            'printf "%s\\n" "$@" >> "$(dirname "$0")/args"\n'
+            'while [ $# -gt 0 ]; do\n'
+            '  [ "$1" = "--compile" ] && [ -z "$NO_CAR" ] && touch "$2/Assets.car"\n'
+            "  shift\n"
+            "done\n", encoding="utf-8")
+        tool.chmod(0o755)
+        return dev
+
+    def test_finds_an_actool_from_xcode_26(self):
+        if not shutil.which("bash"):
+            self.skipTest("no bash")
+        dev = self._fake_xcode("26.1")
+        done = self._bash(f"DEVELOPER_DIR={shlex.quote(str(dev))}; find_actool; "
+                          'actool_major "$(find_actool)"')
+        self.assertEqual(done.stdout.splitlines(),
+                         [str(dev / "usr" / "bin" / "actool"), "26"])
+
+    def test_an_older_actool_is_not_used(self):
+        # Before Xcode 26, actool knows no Icon Composer files.
+        if not shutil.which("bash"):
+            self.skipTest("no bash")
+        dev = self._fake_xcode("16.4")
+        done = self._bash(f"DEVELOPER_DIR={shlex.quote(str(dev))}; find_actool")
+        self.assertNotIn(str(dev), done.stdout)
+
+    def test_compiles_the_icon_into_assets_car(self):
+        if not shutil.which("bash"):
+            self.skipTest("no bash")
+        dev = self._fake_xcode("26.1")
+        tool = dev / "usr" / "bin" / "actool"
+        out = Path(tempfile.mkdtemp(prefix="chuutube-car-"))
+        self.addCleanup(shutil.rmtree, out, True)
+        done = self._bash(f"compile_icon {shlex.quote(str(tool))} {shlex.quote(str(out / 'icon'))}; "
+                          "echo rc=$?")
+        self.assertIn("rc=0", done.stdout, done.stderr)
+        self.assertTrue((out / "icon" / "Assets.car").is_file())
+        args = (tool.parent / "args").read_text(encoding="utf-8").splitlines()
+        # Its own Xcode, or actool cannot find icontool.
+        self.assertEqual(args[0], f"DEVELOPER_DIR={dev}")
+        self.assertEqual(args[1], str(self.ROOT / "assets" / "ChuuTubePoi.icon"))
+        line = " ".join(args[1:])
+        for part in ("--app-icon ChuuTubePoi", "--include-all-app-icons",
+                     "--platform macosx", "--target-device mac",
+                     "--minimum-deployment-target 26.0",
+                     f"--compile {out / 'icon'}"):
+            self.assertIn(part, line)
+
+    def test_no_assets_car_is_a_failure(self):
+        if not shutil.which("bash"):
+            self.skipTest("no bash")
+        dev = self._fake_xcode("26.1")
+        out = Path(tempfile.mkdtemp(prefix="chuutube-car-"))
+        self.addCleanup(shutil.rmtree, out, True)
+        done = self._bash(f"export NO_CAR=1; compile_icon "
+                          f"{shlex.quote(str(dev / 'usr' / 'bin' / 'actool'))} "
+                          f"{shlex.quote(str(out))}; echo rc=$?")
+        self.assertIn("rc=1", done.stdout)
+
+    def test_the_app_gets_both_icons_before_signing(self):
+        main = self._script().split("main() {")[1]
+        # Found out before PyInstaller runs, not after.
+        self.assertLess(main.index('actool="$(find_actool)"'),
+                        main.index('logged "PyInstaller"'))
+        self.assertIn('MAC_NO_ASSETS_CAR:-}" = "1"', main)
+        self.assertIn("Xcode 26 or later is needed", main)
+        copy = main.index('cp "$ROOT/build/icon/Assets.car" "$APP/Contents/Resources/Assets.car"')
+        name = main.index('plutil -replace CFBundleIconName -string "$ICON_NAME" "$plist"')
+        sign = main.index("codesign --force")
+        self.assertLess(copy, sign)
+        self.assertLess(name, sign)
+        # The .icns stays the icon for macOS 14 and 15.
+        self.assertIn("CFBundleIconFile raw", main)
+        self.assertIn('ICON_NAME="ChuuTubePoi"', self._script())
+
+    def test_the_icon_composer_file_is_complete(self):
+        icon = self.ROOT / "assets" / "ChuuTubePoi.icon"
+        import json
+        spec = json.loads((icon / "icon.json").read_text(encoding="utf-8"))
+        images = [layer["image-name"] for group in spec["groups"]
+                  for layer in group["layers"]]
+        self.assertTrue(images)
+        for name in images:
+            self.assertTrue((icon / "Assets" / name).is_file(), name)
+
+    def test_ad_hoc_unless_a_certificate_is_named(self):
+        if not shutil.which("bash"):
+            self.skipTest("no bash")
+        prelude = (f"CHUUTUBE_BUILD_SOURCE_ONLY=1; . "
+                   f"{shlex.quote(str(self.ROOT / 'build-mac.sh'))}; ")
+        # Its own environment: build-mac.sh runs these tests, and with a
+        # certificate named the variable is set here too (tester, 1.1).
+        plain = {k: v for k, v in os.environ.items() if k != "MAC_SIGN_IDENTITY"}
+        def sign_id(env):
+            return subprocess.run(["bash", "-c", prelude + 'echo "$SIGN_ID"'],
+                                  capture_output=True, text=True,
+                                  env=env).stdout.strip()
+        self.assertEqual(sign_id(plain), "-")
+        self.assertEqual(sign_id(dict(plain, MAC_SIGN_IDENTITY="ChuuTubePoi Signing")),
+                         "ChuuTubePoi Signing")
+
+    def test_every_signature_uses_the_same_identity(self):
+        # Tester, 1.1: ad hoc, each build was a new app to macOS, and Full
+        # Disk Access had to be removed and given again every time.
+        main = self._script().split("main() {")[1]
+        signs = re.findall(r"codesign --force[^\n]*", main)
+        self.assertEqual(len(signs), 2)
+        for line in signs:
+            with self.subTest(line):
+                self.assertIn('--sign "$SIGN_ID"', line)
+        self.assertNotIn("--sign -", main)
+        # Without -v: a self-made certificate is not "valid" to macOS.
+        self.assertIn('security find-identity -p codesigning', main)
+        self.assertNotIn('find-identity -v', main)
+
+    def test_how_to_make_the_certificate_is_written_down(self):
+        releasing = (self.ROOT / "RELEASING.md").read_text(encoding="utf-8")
+        self.assertIn("Certificate Assistant", " ".join(releasing.split()))
+        self.assertIn('MAC_SIGN_IDENTITY="ChuuTubePoi Signing" bash build-mac.sh',
+                      " ".join(releasing.split()))
+
+    def test_the_built_app_is_tried_before_it_is_zipped(self):
+        main = self._script().split("main() {")[1]
+        zip_at = main.index("ditto -c -k")
+        for check in ("--yt-dlp --version", "--syphon-check",
+                      "codesign --verify --deep --strict", "forbidden_in"):
+            with self.subTest(check):
+                self.assertLess(main.index(check), zip_at)
+        self.assertLess(main.index("unittest discover"),
+                        main.index("-m PyInstaller"))
+
+
+class MacAppTests(unittest.TestCase):
+    """The macOS app keeps its files in ~/Library/Application Support (1.1)."""
+
+    def test_only_an_app_bundle_counts(self):
+        yes = "/Applications/ChuuTubePoi.app/Contents/MacOS/ChuuTubePoi"
+        self.assertTrue(bootstrap.is_mac_app(yes, frozen=True))
+        self.assertFalse(bootstrap.is_mac_app(yes, frozen=False))
+        for no in ("/Users/k/ChuuTubePoi/ChuuTubePoi",
+                   "C:/ChuuTubePoi/ChuuTubePoi.exe",
+                   "/x/Contents/MacOS/ChuuTubePoi"):
+            with self.subTest(no):
+                self.assertFalse(bootstrap.is_mac_app(no, frozen=True))
+
+    def test_from_source_nothing_changes(self):
+        self.assertFalse(bootstrap.is_mac_app())
+        self.assertEqual(bootstrap.project_root(), ROOT)
+        self.assertEqual(bootstrap.bundled_dir(), ROOT)
+
+    def test_the_data_folder_gets_a_settings_file_once(self):
+        home = Path(tempfile.mkdtemp(prefix="chuutube-home-"))
+        bundle = Path(tempfile.mkdtemp(prefix="chuutube-bundle-"))
+        self.addCleanup(shutil.rmtree, home, True)
+        self.addCleanup(shutil.rmtree, bundle, True)
+        (bundle / "settings.txt.example").write_text("SENDER_FIT=fit\n",
+                                                     encoding="utf-8")
+        # expanduser itself, not HOME: on Windows it reads USERPROFILE, and
+        # this test then made the folder in the real user profile (K, 1.1).
+        with mock.patch.object(bootstrap.os.path, "expanduser",
+                               lambda p: p.replace("~", str(home), 1)), \
+             mock.patch.object(sys, "_MEIPASS", str(bundle), create=True):
+            root = bootstrap.mac_data_dir()
+            self.assertEqual(root, home / "Library" / "Application Support"
+                             / "ChuuTubePoi")
+            settings = root / "settings.txt"
+            self.assertEqual(settings.read_text(encoding="utf-8"),
+                             "SENDER_FIT=fit\n")
+            settings.write_text("MINE=1\n", encoding="utf-8")
+            bootstrap.mac_data_dir()
+            self.assertEqual(settings.read_text(encoding="utf-8"), "MINE=1\n")
+
+    def test_in_the_app_files_go_to_the_data_folder(self):
+        with mock.patch.object(bootstrap, "is_mac_app", lambda *a, **k: True), \
+             mock.patch.object(bootstrap, "mac_data_dir",
+                               lambda: Path("/data")), \
+             mock.patch.object(sys, "_MEIPASS", "/bundle", create=True):
+            self.assertEqual(bootstrap.project_root(), Path("/data"))
+            self.assertEqual(bootstrap.bundled_dir(), Path("/bundle"))
+
+    def test_the_first_start_runs_the_bundled_setup_sh(self):
+        tmp = Path(tempfile.mkdtemp(prefix="chuutube-res-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.assertIsNone(firstrun.runtime_command(tmp, platform="darwin"))
+        (tmp / "setup.sh").write_text("x", encoding="utf-8")
+        self.assertEqual(firstrun.runtime_command(tmp, platform="darwin"),
+                         ["/bin/bash", str(tmp / "setup.sh"), "--runtime-only"])
+
+    def test_setup_sh_is_told_where_to_install(self):
+        with mock.patch.object(firstrun, "project_root", lambda: Path("/data")), \
+             mock.patch.object(firstrun, "bundled_dir", lambda: Path("/bundle")), \
+             mock.patch.object(firstrun, "plugin_version", lambda: "2.0.0"):
+            env = firstrun.installer_env("darwin")
+        self.assertEqual(env["CHUUTUBE_ROOT"], str(Path("/data")))
+        self.assertEqual(env["CHUUTUBE_RESOURCES"], str(Path("/bundle")))
+        self.assertEqual(env["CHUUTUBE_PLUGIN_VERSION"], "2.0.0")
+        self.assertIsNone(firstrun.installer_env("win32"))
+
+    def test_the_plugin_version_is_also_read_from_the_bundle(self):
+        # If the package metadata cannot be asked, the folder PyInstaller
+        # leaves beside the frozen modules says it - as setup.ps1 reads it.
+        bundle = Path(tempfile.mkdtemp(prefix="chuutube-bundle-"))
+        self.addCleanup(shutil.rmtree, bundle, True)
+        (bundle / "bgutil_ytdlp_pot_provider-2.0.0.dist-info").mkdir()
+        def missing(name):
+            raise LookupError(name)
+        with mock.patch("importlib.metadata.version", missing), \
+             mock.patch.object(firstrun, "bundled_dir", lambda: bundle):
+            self.assertEqual(firstrun.plugin_version(), "2.0.0")
+        with mock.patch("importlib.metadata.version", missing), \
+             mock.patch.object(firstrun, "bundled_dir",
+                               lambda: bundle / "nothing"):
+            self.assertEqual(firstrun.plugin_version(), "")
+
+    def test_the_installer_gets_that_environment(self):
+        seen = []
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = firstrun._Installer(
+                [sys.executable, "-c",
+                 "import os; print(os.environ.get('CHUUTUBE_ROOT'))"],
+                env=dict(os.environ, CHUUTUBE_ROOT="/x/y")).run(seen.append)
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, ["/x/y"])
+
+    def test_what_is_missing_from_the_data_folder(self):
+        root = Path(tempfile.mkdtemp(prefix="chuutube-data-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        self.assertEqual(firstrun.mac_runtime_missing(root),
+                         ["Node.js", "the PO token generator"])
+        (root / "node" / "bin").mkdir(parents=True)
+        (root / "node" / "bin" / "node").write_text("", encoding="utf-8")
+        build = root / "bgutil-server" / "x-2.0.0" / "server" / "build"
+        build.mkdir(parents=True)
+        (build / "main.js").write_text("", encoding="utf-8")
+        self.assertEqual(firstrun.mac_runtime_missing(root), [])
+
+    def test_from_source_it_is_not_offered_at_start(self):
+        self.assertFalse(firstrun.should_offer_at_start())
+
+    def test_the_app_offers_once_then_does_not_loop(self):
+        source = Path(app_mod.__file__).read_text(encoding="utf-8")
+        start = source.index("firstrun.should_offer_at_start()")
+        later = source.index("from .firstrun import offer_runtime_install")
+        self.assertLess(start, later)
+        self.assertIn("if offered or not offer_runtime_install(exc):", source)
+
+    def test_help_says_where_settings_are_in_the_app(self):
+        with mock.patch("chuutubepoi.logfile.path", lambda: "/d/logs/x.log"), \
+             mock.patch.object(config, "SETTINGS_FILE", None), \
+             mock.patch.object(bootstrap, "is_mac_app", lambda *a, **k: True), \
+             mock.patch.object(bootstrap, "mac_data_dir", lambda: Path("/d")):
+            text = ui_mod.log_line()
+        self.assertIn(str(Path("/d") / "settings.txt"), text)
+        self.assertIn(ui_mod.SETTINGS_BUTTON, text)
 
 
 class _SyncThread:
@@ -610,7 +2477,7 @@ class TransportGlyphTests(unittest.TestCase):
         self.assertEqual(w.panels[0].play_btn.property("role"), "transport")
 
     def test_it_is_not_the_colour_that_means_live(self):
-        from chuutube2spout import theme
+        from chuutubepoi import theme
         self.assertIn('QPushButton[role="transport"]', theme.STYLESHEET)
         block = theme.STYLESHEET.split('QPushButton[role="transport"]')[1]
         block = block[:block.index("}")]
@@ -708,24 +2575,26 @@ class ProgressTextTests(unittest.TestCase):
 
 
 class JsRuntimeArgTests(unittest.TestCase):
-    """Answering "is deno actually being used?" rather than assuming."""
+    """Answering "is Node actually being used?" rather than assuming."""
 
-    def test_points_at_deno_when_present(self):
-        real = downloader.shutil.which
-        downloader.shutil.which = lambda name: "C:/deno/deno.exe"
-        try:
+    def test_points_at_node_when_present(self):
+        with mock.patch.object(downloader, "find_node",
+                               lambda: "C:/app/node/node.exe"):
             self.assertEqual(js_runtime_arg(),
-                             ["--js-runtimes", "deno:C:/deno/deno.exe"])
-        finally:
-            downloader.shutil.which = real
+                             ["--no-js-runtimes", "--js-runtimes",
+                              "node:C:/app/node/node.exe"])
+
+    def test_deno_is_switched_off_before_node_is_named(self):
+        # yt-dlp ranks deno above node and enables deno by default. Without
+        # the clear, a deno.exe left from before 1.1 would stay in charge.
+        with mock.patch.object(downloader, "find_node", lambda: "node"):
+            args = js_runtime_arg()
+        self.assertLess(args.index("--no-js-runtimes"),
+                        args.index("--js-runtimes"))
 
     def test_says_nothing_when_absent(self):
-        real = downloader.shutil.which
-        downloader.shutil.which = lambda name: None
-        try:
+        with mock.patch.object(downloader, "find_node", lambda: None):
             self.assertEqual(js_runtime_arg(), [])
-        finally:
-            downloader.shutil.which = real
 
 
 class YtdlpSubprocessTests(unittest.TestCase):
@@ -739,7 +2608,8 @@ class YtdlpSubprocessTests(unittest.TestCase):
         cls.dir = tempfile.mkdtemp(prefix="chuutube-fake-")
         source = Path(__file__).resolve().parent / "fake_ytdlp.py"
         cls.tools = {}
-        for name in ("good_ytdlp", "failing_ytdlp", "old_ytdlp",
+        for name in ("good_ytdlp", "failing_ytdlp", "old_ytdlp", "notalink_ytdlp",
+                     "oldfailing_ytdlp",
                      "muxed_ytdlp", "noaudio_ytdlp"):
             path = Path(cls.dir) / f"{name}.py"
             shutil.copy(source, path)
@@ -824,13 +2694,49 @@ class YtdlpSubprocessTests(unittest.TestCase):
 
     def test_retries_without_the_js_flag_on_an_older_yt_dlp(self):
         self._use("old_ytdlp")
-        real = downloader.shutil.which
-        downloader.shutil.which = lambda name: "/usr/bin/deno"
-        try:
+        err = io.StringIO()
+        with mock.patch.object(downloader, "find_node", lambda: "/usr/bin/node"), \
+             contextlib.redirect_stderr(err):
             clip = downloader.download("https://example/watch", 1080, self.cache)
-        finally:
-            downloader.shutil.which = real
         self.assertTrue(Path(clip.video_path).is_file())
+        # Straight to the js-less retry of the same client, not four more
+        # attempts that stop on the same unknown option first.
+        tried = re.findall(r"\[chuutube\] trying: (.+)", err.getvalue())
+        self.assertEqual(tried[:2], ["default", "default (no js flag)"])
+
+    def test_an_old_yt_dlp_is_told_about_the_flag_once(self):
+        # Every queued attempt is replaced by its js-less version, so none of
+        # them stops on the unknown option again.
+        self._use("oldfailing_ytdlp")
+        err = io.StringIO()
+        with mock.patch.object(downloader, "find_node", lambda: "/usr/bin/node"), \
+             contextlib.redirect_stderr(err), \
+             self.assertRaises(downloader.DownloadError):
+            downloader.download("https://example/watch", 1080, self.cache)
+        self.assertEqual(err.getvalue().count("no such option"), 1)
+
+    def test_the_js_flag_is_only_dropped_when_yt_dlp_asks(self):
+        # The tester's Mac: after four ordinary failures the chain ran a
+        # "no js flag" attempt anyway, and yt-dlp used the system deno.
+        with mock.patch.object(downloader, "find_node", lambda: "/usr/bin/node"):
+            for label, extra in downloader._strategies():
+                with self.subTest(label):
+                    self.assertIn("--no-js-runtimes", extra)
+
+    def test_without_js_flags_takes_the_value_too(self):
+        self.assertEqual(downloader.without_js_flags(
+            ["--no-js-runtimes", "--js-runtimes", "node:/x", "--extractor-args",
+             "youtube:player_client=tv"]),
+            ["--extractor-args", "youtube:player_client=tv"])
+
+    def test_text_that_is_not_a_link_stops_after_one_attempt(self):
+        self._use("notalink_ytdlp")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), \
+             self.assertRaises(downloader.DownloadError) as caught:
+            downloader.download("ur mom gae", 1080, self.cache)
+        self.assertEqual(err.getvalue().count("[chuutube] trying:"), 1)
+        self.assertIn("not a valid URL", str(caught.exception))
 
     def test_every_strategy_is_tried_before_giving_up(self):
         # A single client failing must not end the attempt: YouTube keeps
@@ -1107,7 +3013,7 @@ class SettingsFileTests(unittest.TestCase):
 
     def _load(self, text, environ=None):
         import importlib
-        from chuutube2spout import config as cfg
+        from chuutubepoi import config as cfg
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "settings.txt"
             path.write_text(text, encoding="utf-8")
@@ -1124,25 +3030,25 @@ class SettingsFileTests(unittest.TestCase):
 
     def test_reads_plain_key_values(self):
         env = self._load("COOKIES_FROM_BROWSER=waterfox\n")
-        self.assertEqual(env["CHUUTUBE2SPOUT_COOKIES_FROM_BROWSER"], "waterfox")
+        self.assertEqual(env["CHUUTUBEPOI_COOKIES_FROM_BROWSER"], "waterfox")
 
     def test_prefix_is_optional_but_accepted(self):
-        env = self._load("CHUUTUBE2SPOUT_HWDEC=no\n")
-        self.assertEqual(env["CHUUTUBE2SPOUT_HWDEC"], "no")
+        env = self._load("CHUUTUBEPOI_HWDEC=no\n")
+        self.assertEqual(env["CHUUTUBEPOI_HWDEC"], "no")
 
     def test_a_comment_after_the_value_is_not_part_of_it(self):
         # settings.txt.example had `#HWDEC=no   # black video...` lines; taken
         # off the leading #, the old parser stored the whole rest of the line.
         env = self._load("HWDEC=no              # black video or a crash\n"
                          "LOG_KEEP=30\t# kept\n")
-        self.assertEqual(env["CHUUTUBE2SPOUT_HWDEC"], "no")
-        self.assertEqual(env["CHUUTUBE2SPOUT_LOG_KEEP"], "30")
+        self.assertEqual(env["CHUUTUBEPOI_HWDEC"], "no")
+        self.assertEqual(env["CHUUTUBEPOI_LOG_KEEP"], "30")
 
     def test_a_colour_is_not_mistaken_for_a_comment(self):
         env = self._load("SENDER_BACKGROUND=#101018\n"
                          "SENDER_A=#1 # note\n")
-        self.assertEqual(env["CHUUTUBE2SPOUT_SENDER_BACKGROUND"], "#101018")
-        self.assertEqual(env["CHUUTUBE2SPOUT_SENDER_A"], "#1")
+        self.assertEqual(env["CHUUTUBEPOI_SENDER_BACKGROUND"], "#101018")
+        self.assertEqual(env["CHUUTUBEPOI_SENDER_A"], "#1")
 
     def test_every_example_line_parses_cleanly(self):
         # Uncomment every setting in the shipped example at once: no value may
@@ -1154,9 +3060,9 @@ class SettingsFileTests(unittest.TestCase):
         env = self._load("\n".join(lines) + "\n")
         source = "\n".join(
             p.read_text(encoding="utf-8")
-            for p in (ROOT / "chuutube2spout").glob("*.py"))
+            for p in (ROOT / "chuutubepoi").glob("*.py"))
         for key, value in env.items():
-            name = key.replace("CHUUTUBE2SPOUT_", "", 1)
+            name = key.replace("CHUUTUBEPOI_", "", 1)
             with self.subTest(name=name):
                 self.assertNotIn(" ", value.strip(),
                                  f"{name}={value!r} carries a comment")
@@ -1166,7 +3072,7 @@ class SettingsFileTests(unittest.TestCase):
     def test_tolerates_a_line_pasted_from_a_batch_file(self):
         # "set X=y & rem comment" would otherwise store "y & rem comment".
         env = self._load("set COOKIES_FROM_BROWSER=waterfox & rem sign in\n")
-        self.assertEqual(env["CHUUTUBE2SPOUT_COOKIES_FROM_BROWSER"], "waterfox")
+        self.assertEqual(env["CHUUTUBEPOI_COOKIES_FROM_BROWSER"], "waterfox")
 
     def test_ignores_comments_and_blanks(self):
         env = self._load("# COOKIES_FROM_BROWSER=chrome\n\n; HWDEC=no\nrem LOOP=0\n")
@@ -1174,15 +3080,15 @@ class SettingsFileTests(unittest.TestCase):
 
     def test_strips_quotes(self):
         env = self._load('SENDER_A="my sender"\n')
-        self.assertEqual(env["CHUUTUBE2SPOUT_SENDER_A"], "my sender")
+        self.assertEqual(env["CHUUTUBEPOI_SENDER_A"], "my sender")
 
     def test_a_real_environment_variable_still_wins(self):
-        env = self._load("HWDEC=no\n", environ={"CHUUTUBE2SPOUT_HWDEC": "auto-safe"})
-        self.assertEqual(env["CHUUTUBE2SPOUT_HWDEC"], "auto-safe")
+        env = self._load("HWDEC=no\n", environ={"CHUUTUBEPOI_HWDEC": "auto-safe"})
+        self.assertEqual(env["CHUUTUBEPOI_HWDEC"], "auto-safe")
 
     def test_a_line_without_an_equals_is_skipped(self):
         env = self._load("nonsense\nHWDEC=no\n")
-        self.assertEqual(env, {"CHUUTUBE2SPOUT_HWDEC": "no"})
+        self.assertEqual(env, {"CHUUTUBEPOI_HWDEC": "no"})
 
 
 class CookieResolutionTests(unittest.TestCase):
@@ -1699,7 +3605,7 @@ class DragRepaintTests(unittest.TestCase):
         # Spout no longer drops to ~30fps whenever the window moves.
         self.assertEqual(config.DRAG_SETTLE_MS, 0)
         surface_mod.DRAG_SETTLE_MS = 0
-        from chuutube2spout.surface import TICK_INTERVAL_MS
+        from chuutubepoi.surface import TICK_INTERVAL_MS
         w = MainWindow()
         w.moveEvent(object())
         w.resizeEvent(object())
@@ -1738,12 +3644,12 @@ class DragRepaintTests(unittest.TestCase):
         # Pausing only the repaint was not enough: the loop wakes 250 times a
         # second, and every wakeup is one more thing the modal move loop has to
         # get past before it can move the window.
-        from chuutube2spout.config import DRAG_TICK_MS
+        from chuutubepoi.config import DRAG_TICK_MS
         self.w.moveEvent(object())
         self.assertEqual(self.surface._timer.interval, DRAG_TICK_MS)
 
     def test_the_render_loop_speeds_back_up_afterwards(self):
-        from chuutube2spout.surface import TICK_INTERVAL_MS
+        from chuutubepoi.surface import TICK_INTERVAL_MS
         self.w.moveEvent(object())
         self.surface._end_interaction()
         self.assertEqual(self.surface._timer.interval, TICK_INTERVAL_MS)
@@ -1751,7 +3657,7 @@ class DragRepaintTests(unittest.TestCase):
     def test_output_is_never_paused_by_default(self):
         # Freezing Spout during a drag is a diagnostic, not a default -
         # Resolume is showing that output to a room.
-        from chuutube2spout import config
+        from chuutubepoi import config
         self.assertFalse(config.DRAG_PAUSE_RENDER)
 
 
@@ -2204,7 +4110,7 @@ class PreviewGeometryTests(unittest.TestCase):
         self.w = MainWindow()
 
     def test_the_height_makes_both_cells_sixteen_by_nine(self):
-        from chuutube2spout.surface import BORDER, GAP
+        from chuutubepoi.surface import BORDER, GAP
         for width in (1300, 1000, 640):
             height = self.w.surface.height_for_width(width)
             cell_w = (width - GAP) // 2
@@ -2331,24 +4237,24 @@ class WindowScaleTests(unittest.TestCase):
 
     def test_max_is_recognised_by_several_names(self):
         for word in ("max", "fit", "screen", "full", "MAX"):
-            with _env(CHUUTUBE2SPOUT_WINDOW_SCALE=word):
+            with _env(CHUUTUBEPOI_WINDOW_SCALE=word):
                 self.assertTrue(config._fill_screen(), word)
                 self.assertEqual(config._scale(), 1.0, word)
 
     def test_a_number_is_not_mistaken_for_max(self):
-        with _env(CHUUTUBE2SPOUT_WINDOW_SCALE="2"):
+        with _env(CHUUTUBEPOI_WINDOW_SCALE="2"):
             self.assertFalse(config._fill_screen())
             self.assertEqual(config._scale(), 2.0)
 
     def test_a_nonsense_value_is_ignored_rather_than_fatal(self):
-        with _env(CHUUTUBE2SPOUT_WINDOW_SCALE="enormous"):
+        with _env(CHUUTUBEPOI_WINDOW_SCALE="enormous"):
             self.assertEqual(config._scale(), 1.0)
 
     def test_an_absurd_value_is_clamped(self):
         # A typo here means a window whose controls you cannot reach.
-        with _env(CHUUTUBE2SPOUT_WINDOW_SCALE="400"):
+        with _env(CHUUTUBEPOI_WINDOW_SCALE="400"):
             self.assertLessEqual(config._scale(), 8.0)
-        with _env(CHUUTUBE2SPOUT_WINDOW_SCALE="0.001"):
+        with _env(CHUUTUBEPOI_WINDOW_SCALE="0.001"):
             self.assertGreaterEqual(config._scale(), 0.25)
 
     def test_the_primary_screen_answers_when_the_windows_own_does_not(self):
@@ -2491,10 +4397,10 @@ class MpvLogNoiseTests(unittest.TestCase):
 
 
 class SettingsPrefixTests(unittest.TestCase):
-    """Settings are CHUUTUBE2SPOUT_<KEY>, with the old prefix still honoured."""
+    """Settings are CHUUTUBEPOI_<KEY>, with the old prefix still honoured."""
 
     def test_the_new_prefix_is_read(self):
-        with _env(CHUUTUBE2SPOUT_HWDEC="d3d11va-copy"):
+        with _env(CHUUTUBEPOI_HWDEC="d3d11va-copy"):
             self.assertEqual(config._text("HWDEC", "auto-safe"), "d3d11va-copy")
 
     def test_the_old_prefix_still_works(self):
@@ -2503,7 +4409,7 @@ class SettingsPrefixTests(unittest.TestCase):
             self.assertEqual(config._text("HWDEC", "auto-safe"), "no")
 
     def test_the_new_prefix_wins_when_both_are_set(self):
-        with _env(CHUUTUBE2SPOUT_HWDEC="new", YT2SPOUT_HWDEC="old"):
+        with _env(CHUUTUBEPOI_HWDEC="new", YT2SPOUT_HWDEC="old"):
             self.assertEqual(config._text("HWDEC", "auto-safe"), "new")
 
     def test_the_default_survives_an_unset_key(self):
@@ -2513,8 +4419,255 @@ class SettingsPrefixTests(unittest.TestCase):
     def test_flags_read_both_prefixes_too(self):
         with _env(YT2SPOUT_LOOP="0"):
             self.assertFalse(config._flag("LOOP", True))
-        with _env(CHUUTUBE2SPOUT_LOOP="0"):
+        with _env(CHUUTUBEPOI_LOOP="0"):
             self.assertFalse(config._flag("LOOP", True))
+
+    # 1.1: renamed from ChuuTube2Spout. Its prefix is the second old one.
+    # Written in two parts here as in config.py: a rename across the tree
+    # must not turn the old name into the new one.
+    OLD = "CHUUTUBE2" + "SPOUT_"
+
+    def test_the_prefix_from_before_1_1_still_works(self):
+        with _env(**{self.OLD + "HWDEC": "no"}):
+            self.assertEqual(config._text("HWDEC", "auto-safe"), "no")
+        with _env(**{self.OLD + "LOOP": "0"}):
+            self.assertFalse(config._flag("LOOP", True))
+
+    def test_new_wins_over_1_0_and_1_0_over_the_oldest(self):
+        with _env(CHUUTUBEPOI_HWDEC="new", **{self.OLD + "HWDEC": "mid"}):
+            self.assertEqual(config._text("HWDEC", "auto-safe"), "new")
+        with _env(YT2SPOUT_HWDEC="oldest", **{self.OLD + "HWDEC": "mid"}):
+            self.assertEqual(config._text("HWDEC", "auto-safe"), "mid")
+
+    def test_no_old_prefix_was_renamed_into_the_new_one(self):
+        self.assertEqual(config.ENV_PREFIX, "CHUUTUBEPOI_")
+        self.assertEqual(config.LEGACY_PREFIXES, (self.OLD, "YT2" + "SPOUT_"))
+        self.assertNotIn(config.ENV_PREFIX, config.LEGACY_PREFIXES)
+
+    def test_a_settings_file_line_with_an_old_prefix_keeps_it(self):
+        tmp = Path(tempfile.mkdtemp(prefix="chuutube-settings-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = tmp / "settings.txt"
+        key = self.OLD + "RENAME_PROBE"
+        path.write_text(f"{key}=1\nRENAME_PROBE_BARE=2\n", encoding="utf-8")
+        with _env(CHUUTUBEPOI_SETTINGS_FILE=str(path)):
+            try:
+                config.load_settings_file()
+                self.assertEqual(os.environ.get(key), "1")
+                self.assertEqual(
+                    os.environ.get("CHUUTUBEPOI_RENAME_PROBE_BARE"), "2")
+                self.assertEqual(config._raw("RENAME_PROBE"), "1")
+            finally:
+                os.environ.pop(key, None)
+                os.environ.pop("CHUUTUBEPOI_RENAME_PROBE_BARE", None)
+
+    def test_a_settings_file_from_an_earlier_name_is_still_found(self):
+        self.assertEqual(config.SETTINGS_FILES[0], "settings.txt")
+        self.assertIn("chuutube2" + "spout.conf", config.SETTINGS_FILES)
+        self.assertIn("yt2spout.conf", config.SETTINGS_FILES)
+
+
+class MacPrivacyRefusalTests(unittest.TestCase):
+    """macOS 27 keeps the app out of Firefox's profile folder (tester, 1.1)."""
+
+    EPERM = PermissionError(1, "Operation not permitted",
+                            "/Users/k/Library/Application Support/Firefox/Profiles")
+
+    def test_it_is_told_apart_from_a_missing_browser(self):
+        self.assertTrue(cookies_mod.refused_by_macos(self.EPERM, "darwin"))
+        self.assertFalse(cookies_mod.refused_by_macos(self.EPERM, "win32"))
+        self.assertFalse(cookies_mod.refused_by_macos(
+            FileNotFoundError(2, "No such file"), "darwin"))
+        self.assertFalse(cookies_mod.refused_by_macos(
+            PermissionError(13, "Permission denied"), "darwin"))
+
+    def test_the_message_says_where_to_allow_it(self):
+        def refuse(*a, **k):
+            raise self.EPERM
+        with mock.patch.object(cookies_mod.sys, "platform", "darwin"), \
+             mock.patch.object(cookies_mod, "profile_path", refuse):
+            ok, text = cookies_mod.check("firefox")
+        self.assertFalse(ok)
+        self.assertIn("Full Disk Access", text)
+        self.assertIn("ChuuTubePoi", text)
+        # Tester, 1.1: the app did not appear in the list by itself.
+        self.assertIn("select +", text)
+        self.assertNotIn("if it is not listed", text)
+        self.assertTrue(text.startswith(cookies_mod.MAC_PRIVACY_START))
+        self.assertNotIn("Is the browser installed", text)
+
+    def _warned(self, problem, app_path=None):
+        shown = []
+        w = MainWindow()
+        with mock.patch.object(ui_mod, "QMessageBox", _FakeBox.make(shown)), \
+             mock.patch.object(ui_mod, "mac_app_path", lambda: app_path), \
+             contextlib.redirect_stderr(io.StringIO()):
+            w._show_cookie_verdict(False, problem)
+        return shown[0]
+
+    def test_the_warning_opens_full_disk_access_and_names_the_app(self):
+        app = Path("/Applications/ChuuTubePoi.app")
+        box = self._warned(cookies_mod.mac_privacy_help("firefox"), app)
+        self.assertEqual([b.text for b in box.buttons],
+                         [ui_mod.PRIVACY_BUTTON, ui_mod.SETTINGS_BUTTON])
+        self.assertIn(str(app), box.text)
+        opened = ui_mod.QDesktopServices.opened
+        opened.clear()
+        box.buttons[0].clicked.emit()
+        self.assertEqual([u.text for u in opened], [ui_mod.FULL_DISK_ACCESS_URL])
+        self.assertIn("Privacy_AllFiles", ui_mod.FULL_DISK_ACCESS_URL)
+
+    def test_other_cookie_problems_get_no_such_button(self):
+        box = self._warned("No browser is set to take the YouTube login from")
+        self.assertEqual([b.text for b in box.buttons], [ui_mod.SETTINGS_BUTTON])
+
+    def test_the_app_path_only_in_the_mac_app(self):
+        self.assertIsNone(ui_mod.mac_app_path())
+        exe = "/Applications/ChuuTubePoi.app/Contents/MacOS/ChuuTubePoi"
+        with mock.patch.object(bootstrap, "is_mac_app", lambda *a, **k: True), \
+             mock.patch.object(ui_mod.sys, "executable", exe):
+            self.assertEqual(ui_mod.mac_app_path(),
+                             Path(exe).resolve().parents[2])
+
+    def test_elsewhere_the_old_message_stays(self):
+        def refuse(*a, **k):
+            raise self.EPERM
+        with mock.patch.object(cookies_mod.sys, "platform", "win32"), \
+             mock.patch.object(cookies_mod, "profile_path", refuse):
+            ok, text = cookies_mod.check("firefox")
+        self.assertIn("Is the browser installed", text)
+
+
+class CleanQuitTests(unittest.TestCase):
+    """The Mac app crashed on quitting: PySide deleted a button twice (1.1)."""
+
+    def test_the_first_run_buttons_belong_to_the_dialog_from_the_start(self):
+        source = Path(firstrun.__file__).read_text(encoding="utf-8")
+        body = source.split("def offer_runtime_install")[1]
+        self.assertIn('QPushButton("Not now", dialog)', body)
+        self.assertIn('QPushButton("Download and install", dialog)', body)
+        self.assertLess(body.index("layout.addLayout(buttons)"),
+                        body.index("buttons.addWidget(quit_btn)"))
+
+    def test_the_app_leaves_without_pythons_qt_cleanup(self):
+        flushed, exits, cleaned = [], [], []
+        with mock.patch("chuutubepoi.logfile.flush_all",
+                        lambda: flushed.append(1)), \
+             mock.patch("chuutubepoi.cookies.cleanup",
+                        lambda: cleaned.append(1)), \
+             mock.patch("os._exit", lambda code: exits.append(code)):
+            self.assertEqual(app_mod.leave(3), 3)
+        self.assertEqual((flushed, cleaned, exits), ([1], [1], [3]))
+
+    def test_main_ends_through_leave(self):
+        source = Path(app_mod.__file__).read_text(encoding="utf-8")
+        self.assertIn("return leave(app.exec())", source)
+        self.assertNotIn("return app.exec()", source)
+
+
+class RenamedToChuuTubePoiTests(unittest.TestCase):
+    """1.1: ChuuTube2Spout became ChuuTubePoi - it sends Syphon too now."""
+
+    OLD = "ChuuTube2" + "Spout"
+
+    def test_the_name(self):
+        import chuutubepoi
+        self.assertEqual(chuutubepoi.APP_NAME, "ChuuTubePoi")
+        self.assertEqual(chuutubepoi.LEGACY_APP_NAMES,
+                         (self.OLD, "yt2" + "spout"))
+
+    def test_one_pair_of_source_names_on_both_systems(self):
+        for platform in ("win32", "darwin"):
+            with self.subTest(platform):
+                self.assertEqual(config.default_sender_names(platform),
+                                 ("ChuuTubePoi-A", "ChuuTubePoi-B"))
+
+    def test_the_old_source_names_are_on_record_for_old_compositions(self):
+        self.assertEqual(config.OLD_SENDER_NAMES,
+                         (self.OLD + "-A", self.OLD + "-B"))
+        example = (ROOT / "settings.txt.example").read_text(encoding="utf-8")
+        self.assertIn("#SENDER_A=" + self.OLD + "-A", example)
+        self.assertIn("#SENDER_B=" + self.OLD + "-B", example)
+
+    def _window_with(self, stores: dict):
+        """A MainWindow whose QSettings are these, by application name."""
+        made = {}
+
+        class _Settings:
+            def __init__(self, org, app=None):
+                self.name = org
+                self._data = stores.setdefault(org, {})
+                made.setdefault(org, self)
+            def value(self, key, default=None, type=None):
+                return self._data.get(key, default)
+            def setValue(self, key, value):
+                self._data[key] = value
+            def allKeys(self):
+                return list(self._data)
+            def sync(self):
+                pass
+        patcher = mock.patch.object(ui_mod, "QSettings", _Settings)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        window = MainWindow()
+        return window, stores
+
+    def test_window_state_comes_over_from_1_0(self):
+        window, stores = self._window_with(
+            {self.OLD: {"geometry": b"g1", "slot0/url": "https://a"},
+             "yt2" + "spout": {"geometry": b"older"}})
+        self.assertEqual(stores["ChuuTubePoi"].get("geometry"), b"g1")
+        self.assertEqual(stores["ChuuTubePoi"].get("slot0/url"), "https://a")
+
+    def test_or_from_the_name_before_that(self):
+        window, stores = self._window_with(
+            {"yt2" + "spout": {"geometry": b"older"}})
+        self.assertEqual(stores["ChuuTubePoi"].get("geometry"), b"older")
+
+    def test_what_is_already_saved_under_the_new_name_stays(self):
+        window, stores = self._window_with(
+            {"ChuuTubePoi": {"geometry": b"mine"},
+             self.OLD: {"geometry": b"g1", "selected": 1}})
+        self.assertEqual(stores["ChuuTubePoi"].get("geometry"), b"mine")
+        self.assertNotIn("selected", stores["ChuuTubePoi"])
+
+    def test_nothing_shipped_still_carries_the_old_name_by_accident(self):
+        # The old name may appear only where it is meant: split in two in the
+        # code, and in the documents that say what the app used to be called.
+        allowed = {"README.md", "SECURITY.md", "settings.txt.example",
+                   "RELEASING.md"}
+        found = []
+        for path in sorted(ROOT.rglob("*")):
+            rel = path.relative_to(ROOT)
+            if not path.is_file() or rel.parts[0] in (
+                    ".git", ".venv", "node", "bgutil-server", "cache", "logs",
+                    "build", "dist", "licenses", "tests") \
+                    or "__pycache__" in rel.parts:
+                continue
+            if path.suffix not in (".py", ".md", ".sh", ".ps1", ".bat",
+                                   ".example", ".yml", ".txt"):
+                continue
+            if path.name in ("ROADMAP.md", "settings.txt") or path.name in allowed:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            if self.OLD.lower() in text.lower():
+                found.append(str(rel))
+        # In comments only: __init__ and config say what the app used to be
+        # called, redact.py quotes a path from a 0.9.9 log, as it was.
+        self.assertEqual(
+            found, [str(Path("chuutubepoi") / name) for name in
+                    ("__init__.py", "config.py", "redact.py")],
+            "if the old folder chuutube2" "spout is listed: delete it, the "
+            "code is in chuutubepoi now")
+
+    def test_the_package_and_the_launcher_carry_the_new_name(self):
+        self.assertTrue((ROOT / "chuutubepoi" / "__init__.py").is_file())
+        self.assertTrue((ROOT / "ChuuTubePoi.bat").is_file())
+        run = (ROOT / "run.py").read_text(encoding="utf-8")
+        self.assertIn("from chuutubepoi.app import main", run)
 
 
 class CookieDomainWiringTests(unittest.TestCase):
@@ -2723,7 +4876,7 @@ class CachePruneTests(unittest.TestCase):
             config.CACHE_MAX_AGE_H)
 
     def test_the_age_limit_is_settable(self):
-        with _env(CHUUTUBE2SPOUT_CACHE_MAX_AGE_H="72"):
+        with _env(CHUUTUBEPOI_CACHE_MAX_AGE_H="72"):
             self.assertEqual(float(config._num("CACHE_MAX_AGE_H", "24")), 72.0)
 
     def test_a_manifest_whose_files_are_gone_is_cleaned_up(self):
@@ -2756,13 +4909,13 @@ class VersionNumberingTests(unittest.TestCase):
 
     def test_the_version_is_all_numbers_and_dots(self):
         # The git tag, the zip name and PyInstaller all carry this string.
-        self.assertRegex(chuutube2spout.__version__, r"^\d+(\.\d+)+$")
+        self.assertRegex(chuutubepoi.__version__, r"^\d+(\.\d+)+$")
 
     def test_a_four_part_version_parses(self):
-        self.assertEqual(chuutube2spout.version_tuple("0.9.9.1"), (0, 9, 9, 1))
+        self.assertEqual(chuutubepoi.version_tuple("0.9.9.1"), (0, 9, 9, 1))
 
     def test_the_fourth_part_sorts_between_its_neighbours(self):
-        step = chuutube2spout.version_tuple
+        step = chuutubepoi.version_tuple
         self.assertLess(step("0.9.9"), step("0.9.9.1"))
         self.assertLess(step("0.9.9.1"), step("0.9.9.2"))
         self.assertLess(step("0.9.9.2"), step("1.0"))
@@ -2770,26 +4923,26 @@ class VersionNumberingTests(unittest.TestCase):
     def test_the_ordering_string_comparison_gets_wrong(self):
         # "0.9.10" < "0.9.9" as strings, which is the whole reason the helper
         # exists rather than the numbers being compared where they are used.
-        step = chuutube2spout.version_tuple
+        step = chuutubepoi.version_tuple
         self.assertLess(step("0.9.9"), step("0.9.10"))
         self.assertTrue("0.9.10" < "0.9.9", "the string trap this avoids")
 
     def test_the_current_version_is_below_one_until_it_is_published(self):
         # build.ps1 runs the suite before it builds, so this is the guard.
-        if not chuutube2spout.PUBLISHED:
-            self.assertLess(chuutube2spout.version_tuple(), (1, 0),
+        if not chuutubepoi.PUBLISHED:
+            self.assertLess(chuutubepoi.version_tuple(), (1, 0),
                             "1.0 is reserved for the release that actually "
                             "gets uploaded - use 0.9.9.1, 0.9.9.2, and on")
 
     def test_published_since_one_point_oh(self):
         # 1.0 is the published release (K, 1.0). From here on every version
         # is at least 1.0, and the flag stays True.
-        self.assertTrue(chuutube2spout.PUBLISHED)
-        self.assertGreaterEqual(chuutube2spout.version_tuple(), (1, 0))
+        self.assertTrue(chuutubepoi.PUBLISHED)
+        self.assertGreaterEqual(chuutubepoi.version_tuple(), (1, 0))
 
     def test_the_rule_is_written_down_where_the_number_is(self):
         # A convention nobody can find is not a convention.
-        source = Path(chuutube2spout.__file__).read_text(encoding="utf-8")
+        source = Path(chuutubepoi.__file__).read_text(encoding="utf-8")
         head = source[:source.index("__version__ =")]
         self.assertIn("0.9.9.1", head)
         self.assertIn("PUBLISHED", head)
@@ -2916,14 +5069,14 @@ class ClearOnExitTests(unittest.TestCase):
         # CACHE_MAX_AGE_H does that now, and a cache that survives the app is
         # what makes the second load of a clip instant.
         self.assertFalse(config.CLEAR_CACHE_ON_EXIT)
-        with _env(CHUUTUBE2SPOUT_CLEAR_CACHE_ON_EXIT="1"):
+        with _env(CHUUTUBEPOI_CLEAR_CACHE_ON_EXIT="1"):
             self.assertTrue(config._flag("CLEAR_CACHE_ON_EXIT", False))
 
     def test_the_size_cap_defaults_to_ten_gb(self):
         self.assertEqual(config.CACHE_MAX_GB, 10.0)
 
     def test_the_size_cap_is_settable(self):
-        with _env(CHUUTUBE2SPOUT_CACHE_MAX_GB="2.5"):
+        with _env(CHUUTUBEPOI_CACHE_MAX_GB="2.5"):
             self.assertEqual(float(config._num("CACHE_MAX_GB", "10")), 2.5)
 
     def test_clearing_happens_after_mpv_is_shut_down(self):
@@ -2992,21 +5145,21 @@ class FrozenLayoutTests(unittest.TestCase):
 
     def setUp(self):
         self.tmp = pathlib.Path(tempfile.mkdtemp())
-        self.saved_env = os.environ.get("CHUUTUBE2SPOUT_CACHE")
-        os.environ.pop("CHUUTUBE2SPOUT_CACHE", None)
+        self.saved_env = os.environ.get("CHUUTUBEPOI_CACHE")
+        os.environ.pop("CHUUTUBEPOI_CACHE", None)
 
     def tearDown(self):
         for attr in ("frozen", "_MEIPASS"):
             if hasattr(sys, attr):
                 delattr(sys, attr)
         if self.saved_env is not None:
-            os.environ["CHUUTUBE2SPOUT_CACHE"] = self.saved_env
+            os.environ["CHUUTUBEPOI_CACHE"] = self.saved_env
         importlib.reload(config)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _freeze(self):
         """Pretend to be a PyInstaller onedir build living in self.tmp."""
-        exe = self.tmp / "ChuuTube2Spout.exe"
+        exe = self.tmp / "ChuuTubePoi.exe"
         exe.write_bytes(b"MZ")
         sys.frozen = True
         sys._MEIPASS = str(self.tmp / "_internal")
@@ -3030,18 +5183,18 @@ class FrozenLayoutTests(unittest.TestCase):
         sys.executable = str(exe)
         # The real lookup, for once: stubs_bootstrap turns it off so the
         # developer's own settings.txt cannot reach the other tests.
-        override = os.environ.pop("CHUUTUBE2SPOUT_SETTINGS_FILE", None)
+        override = os.environ.pop("CHUUTUBEPOI_SETTINGS_FILE", None)
         try:
             importlib.reload(config)
             self.assertEqual(pathlib.Path(config.SETTINGS_FILE),
                              self.tmp / "settings.txt")
-            self.assertEqual(os.environ.get("CHUUTUBE2SPOUT_WINDOW_SCALE"),
+            self.assertEqual(os.environ.get("CHUUTUBEPOI_WINDOW_SCALE"),
                              "1.2")
         finally:
             sys.executable = saved
-            os.environ.pop("CHUUTUBE2SPOUT_WINDOW_SCALE", None)
+            os.environ.pop("CHUUTUBEPOI_WINDOW_SCALE", None)
             if override is not None:
-                os.environ["CHUUTUBE2SPOUT_SETTINGS_FILE"] = override
+                os.environ["CHUUTUBEPOI_SETTINGS_FILE"] = override
             importlib.reload(config)
 
     def test_the_cache_lands_beside_the_exe(self):
@@ -3062,14 +5215,14 @@ class FrozenLayoutTests(unittest.TestCase):
         exe = self._freeze()
         saved = sys.executable
         sys.executable = str(exe)
-        os.environ["CHUUTUBE2SPOUT_CACHE"] = str(self.tmp / "elsewhere")
+        os.environ["CHUUTUBEPOI_CACHE"] = str(self.tmp / "elsewhere")
         try:
             importlib.reload(config)
             self.assertEqual(pathlib.Path(config.CACHE_DIR),
                              self.tmp / "elsewhere")
         finally:
             sys.executable = saved
-            os.environ.pop("CHUUTUBE2SPOUT_CACHE", None)
+            os.environ.pop("CHUUTUBEPOI_CACHE", None)
 
     def test_running_from_source_is_unchanged(self):
         if config._raw("CACHE"):
@@ -3210,46 +5363,321 @@ class ScriptProbeTests(unittest.TestCase):
     def setUp(self):
         self.home = pathlib.Path(tempfile.mkdtemp())
         (self.home / "src").mkdir()
-        (self.home / "src" / "generate_once.ts").write_text("//", encoding="utf-8")
-        self.saved_which = potprovider.shutil.which
+        (self.home / "src" / "main.ts").write_text("//", encoding="utf-8")
+        (self.home / "build").mkdir()
+        (self.home / "build" / "generate_once.js").write_text("//",
+                                                              encoding="utf-8")
+        self.saved_find = potprovider.find_node
         self.saved_run = potprovider.subprocess.run
+        self.calls = []
 
     def tearDown(self):
-        potprovider.shutil.which = self.saved_which
+        potprovider.find_node = self.saved_find
         potprovider.subprocess.run = self.saved_run
         shutil.rmtree(self.home, ignore_errors=True)
 
-    def _deno(self, returncode, stderr=""):
-        potprovider.shutil.which = lambda name: "deno.exe"
+    def _node(self, returncode, stderr=""):
+        potprovider.find_node = lambda: "node.exe"
 
         class Done:
             pass
         done = Done()
-        done.returncode, done.stdout, done.stderr = returncode, "1.3.1", stderr
-        potprovider.subprocess.run = lambda *a, **k: done
+        done.returncode, done.stdout, done.stderr = returncode, "2.0.0", stderr
+
+        def run(cmd, *a, **k):
+            self.calls.append(cmd)
+            return done
+        potprovider.subprocess.run = run
 
     def test_exit_zero_is_ready(self):
-        self._deno(0)
+        self._node(0)
         ok, detail = _REAL_SCRIPT_PROBE(str(self.home))
         self.assertTrue(ok)
 
+    def test_it_runs_what_the_plugin_runs(self):
+        # BgUtilScriptNodePTP checks `node build/generate_once.js --version`
+        # before it will use Node. Probing anything else answers a question
+        # the plugin never asks.
+        self._node(0)
+        _REAL_SCRIPT_PROBE(str(self.home))
+        cmd = self.calls[-1]
+        self.assertEqual(cmd[0], "node.exe")
+        self.assertEqual(Path(cmd[1]).parts[-2:], ("build", "generate_once.js"))
+        self.assertEqual(cmd[2:], ["--version"])
+
     def test_a_failed_run_is_reported_with_its_last_words(self):
-        self._deno(1, "some noise\nerror: Could not find package 'form-data'")
+        self._node(1, "some noise\nError: Cannot find module 'form-data'")
         ok, detail = _REAL_SCRIPT_PROBE(str(self.home))
         self.assertFalse(ok)
         self.assertIn("form-data", detail)
 
-    def test_no_deno_is_not_ready(self):
-        potprovider.shutil.which = lambda name: None
+    def test_no_node_is_not_ready(self):
+        potprovider.find_node = lambda: None
         ok, detail = _REAL_SCRIPT_PROBE(str(self.home))
         self.assertFalse(ok)
-        self.assertIn("deno", detail)
+        self.assertIn("Node.js", detail)
+
+    def test_an_unbuilt_tree_is_not_ready_and_is_not_run(self):
+        self._node(0)
+        (self.home / "build" / "generate_once.js").unlink()
+        ok, detail = _REAL_SCRIPT_PROBE(str(self.home))
+        self.assertFalse(ok)
+        self.assertIn("not built yet", detail)
+        self.assertEqual(self.calls, [])
 
     def test_a_missing_script_is_not_ready(self):
-        potprovider.shutil.which = lambda name: "deno.exe"
-        (self.home / "src" / "generate_once.ts").unlink()
+        self._node(0)
+        (self.home / "src" / "main.ts").unlink()
         ok, detail = _REAL_SCRIPT_PROBE(str(self.home))
         self.assertFalse(ok)
+
+
+class GeneratorBuildTests(unittest.TestCase):
+    """Since 1.1 the generator is built (npm ci, then tsc), not run as source.
+
+    The real install_script_deps, with subprocess.run replaced: no test may
+    start npm or Node.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="chuutube-build-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.home = self.root / "server"
+        (self.home / "src").mkdir(parents=True)
+        (self.home / "src" / "main.ts").write_text("//", encoding="utf-8")
+        self.npm = self.root / "node" / "node_modules" / "npm" / "bin" / "npm-cli.js"
+        self.npm.parent.mkdir(parents=True)
+        self.npm.write_text("//", encoding="utf-8")
+        self.calls = []
+        self.results = {}
+        self.writes_build = True
+        patches = [
+            mock.patch.object(potprovider, "find_node",
+                              lambda: str(self.root / "node" / "node.exe")),
+            mock.patch.object(potprovider.subprocess, "run", self._run),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _run(self, cmd, *args, **kwargs):
+        self.calls.append((cmd, kwargs))
+        step = "tsc" if cmd[1].endswith("tsc") else "npm"
+        if step == "tsc" and self.writes_build:
+            (self.home / "build").mkdir(exist_ok=True)
+            for name in ("main.js", "generate_once.js"):
+                (self.home / "build" / name).write_text("//", encoding="utf-8")
+        code, err = self.results.get(step, (0, ""))
+        return types.SimpleNamespace(returncode=code, stdout="", stderr=err)
+
+    def test_npm_ci_then_tsc_in_the_generator_folder(self):
+        ok, detail = _REAL_INSTALL_DEPS(str(self.home))
+        self.assertTrue(ok, detail)
+        (npm_cmd, npm_kw), (tsc_cmd, tsc_kw) = self.calls
+        self.assertEqual(npm_cmd[1], str(self.npm))
+        self.assertEqual(npm_cmd[2], "ci")
+        self.assertEqual(Path(tsc_cmd[1]).parts[-3:], ("typescript", "bin", "tsc"))
+        self.assertEqual(npm_kw["cwd"], str(self.home))
+        self.assertEqual(tsc_kw["cwd"], str(self.home))
+
+    def test_no_install_script_runs(self):
+        # The same choice deno made: one compromised dependency's install
+        # script would otherwise run as the user.
+        _REAL_INSTALL_DEPS(str(self.home))
+        self.assertIn("--ignore-scripts", self.calls[0][0])
+
+    def test_ci_not_install_so_the_lockfile_decides(self):
+        _REAL_INSTALL_DEPS(str(self.home))
+        self.assertNotIn("install", self.calls[0][0])
+
+    def test_npm_does_not_phone_home_for_updates(self):
+        _REAL_INSTALL_DEPS(str(self.home))
+        env = self.calls[0][1]["env"]
+        self.assertEqual(env["npm_config_update_notifier"], "false")
+
+    def test_a_failed_npm_stops_before_tsc(self):
+        self.results["npm"] = (1, "npm error code EINTEGRITY\nnpm error sha512 mismatch")
+        ok, detail = _REAL_INSTALL_DEPS(str(self.home))
+        self.assertFalse(ok)
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("EINTEGRITY", detail)
+
+    def test_success_is_the_built_files_not_the_exit_code(self):
+        # tsc writes its output even when it also reports a type error.
+        self.results["tsc"] = (2, "src/x.ts(1,1): error TS2322")
+        ok, _ = _REAL_INSTALL_DEPS(str(self.home))
+        self.assertTrue(ok)
+
+    def test_no_built_files_is_a_failure_with_tsc_s_words(self):
+        self.writes_build = False
+        self.results["tsc"] = (1, "error TS5058: The specified path does not exist")
+        ok, detail = _REAL_INSTALL_DEPS(str(self.home))
+        self.assertFalse(ok)
+        self.assertIn("TS5058", detail)
+
+    def test_no_node_no_attempt(self):
+        with mock.patch.object(potprovider, "find_node", lambda: None):
+            ok, detail = _REAL_INSTALL_DEPS(str(self.home))
+        self.assertFalse(ok)
+        self.assertEqual(self.calls, [])
+
+    def test_no_npm_no_attempt(self):
+        self.npm.unlink()
+        ok, detail = _REAL_INSTALL_DEPS(str(self.home))
+        self.assertFalse(ok)
+        self.assertIn("npm", detail)
+        self.assertEqual(self.calls, [])
+
+
+class DoctorWaitsForTheServerTests(unittest.TestCase):
+    """--doctor reports what the app ends up using, not its first second.
+
+    K's 1.0.1 setup log: "PO token provider - script mode", then "script mode
+    ready" - and no server line, because the server starts only after the
+    background check, and the diagnostics had already reported.
+    """
+
+    def _provider(self, ok):
+        p = potprovider.PotProvider()
+        p._script_home = "/srv"
+        p._script_ok = ok
+        p._prepared.set()
+        calls = []
+        p._start_server = lambda: calls.append(True) or True
+        return p, calls
+
+    def test_a_working_script_mode_gives_the_server_its_chance(self):
+        p, calls = self._provider(True)
+        p.wait_settled(timeout=1)
+        self.assertEqual(calls, [True])
+
+    def test_a_broken_script_mode_does_not_retry_the_server(self):
+        p, calls = self._provider(False)
+        p.wait_settled(timeout=1)
+        self.assertEqual(calls, [])
+
+    def test_nothing_to_wait_for_returns_at_once(self):
+        p = potprovider.PotProvider()
+        p._start_server = lambda: self.fail("must not start anything")
+        p.wait_settled(timeout=0)
+
+    def test_the_diagnostics_wait_before_they_report(self):
+        source = Path(doctor.__file__).read_text(encoding="utf-8")
+        body = source.split("started_here =")[1]
+        self.assertLess(body.index("provider.wait_settled()"),
+                        body.index("server_up = provider.running"))
+
+
+class SuiteIsolationTests(unittest.TestCase):
+    """The suite never starts a real token generator, whatever is installed."""
+
+    def test_the_developer_s_own_tree_is_out_of_sight(self):
+        self.assertEqual(potprovider.project_root(), _SUITE_ROOT)
+        self.assertNotEqual(_SUITE_ROOT, bootstrap.project_root())
+        self.assertEqual(list(_SUITE_ROOT.iterdir()), [])
+
+    def test_the_token_port_is_never_really_probed(self):
+        with mock.patch.object(potprovider.socket, "create_connection",
+                               lambda *a, **k: self.fail("probed 4416")):
+            self.assertFalse(potprovider.port_is_open(potprovider.DEFAULT_PORT))
+
+    def test_a_main_window_never_starts_the_exe(self):
+        root = Path(tempfile.mkdtemp(prefix="chuutube-iso-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "bgutil-pot.exe").write_text("", encoding="utf-8")
+        started = []
+        provider = potprovider.PotProvider()
+        with mock.patch.object(potprovider, "project_root", lambda: root), \
+             mock.patch.object(potprovider, "plugin_version", lambda: None), \
+             mock.patch.object(potprovider, "port_is_open", lambda *a, **k: False), \
+             mock.patch.object(potprovider, "find_script_home", lambda: None), \
+             mock.patch.object(potprovider.subprocess, "Popen",
+                               lambda *a, **k: started.append(a) or 1/0), \
+             contextlib.redirect_stderr(io.StringIO()):
+            provider.start()
+        self.assertEqual(started, [])
+
+    def test_the_real_lookup_still_finds_the_exe_beside_the_app(self):
+        root = Path(tempfile.mkdtemp(prefix="chuutube-iso-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        exe = root / "bgutil-pot.exe"
+        exe.write_text("", encoding="utf-8")
+        with mock.patch.object(potprovider, "project_root", lambda: root):
+            self.assertEqual(_REAL_FIND_EXECUTABLE(), str(exe))
+
+
+class FindNodeTests(unittest.TestCase):
+    """Where the app finds Node.js, and npm beside it."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="chuutube-node-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        patcher = mock.patch.object(bootstrap, "project_root", lambda: self.root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _touch(self, *parts):
+        path = self.root.joinpath(*parts)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+        return path
+
+    def test_our_copy_wins_over_path(self):
+        ours = self._touch("node", "node.exe")
+        with mock.patch.object(bootstrap.shutil, "which", lambda n: "/usr/bin/node"):
+            self.assertEqual(_REAL_FIND_NODE(), str(ours))
+
+    def test_the_tarball_layout_is_found_too(self):
+        # macOS and Linux: node/bin/node. Ready for the Mac version.
+        ours = self._touch("node", "bin", "node")
+        with mock.patch.object(bootstrap.shutil, "which", lambda n: None):
+            self.assertEqual(_REAL_FIND_NODE(), str(ours))
+
+    def test_path_is_the_fallback(self):
+        with mock.patch.object(bootstrap.shutil, "which", lambda n: "/usr/bin/node"):
+            self.assertEqual(_REAL_FIND_NODE(), "/usr/bin/node")
+
+    def test_npm_beside_the_windows_zip_layout(self):
+        node = self._touch("node", "node.exe")
+        cli = self._touch("node", "node_modules", "npm", "bin", "npm-cli.js")
+        self.assertEqual(bootstrap.npm_cli(str(node)), cli)
+
+    def test_npm_beside_the_tarball_layout(self):
+        node = self._touch("node", "bin", "node")
+        cli = self._touch("node", "lib", "node_modules", "npm", "bin", "npm-cli.js")
+        self.assertEqual(bootstrap.npm_cli(str(node)), cli)
+
+    def test_no_npm_is_none(self):
+        node = self._touch("node", "node.exe")
+        self.assertIsNone(bootstrap.npm_cli(str(node)))
+        self.assertIsNone(bootstrap.npm_cli(None))
+
+    def test_the_node_folder_goes_on_path(self):
+        self._touch("node", "node.exe")
+        saved = os.environ.get("PATH", "")
+        self.addCleanup(os.environ.__setitem__, "PATH", saved)
+        added = bootstrap.prepare_native_paths()
+        self.assertIn(self.root / "node", added)
+        self.assertTrue(os.environ["PATH"].startswith(str(self.root / "node")))
+
+    def test_the_version_is_asked_once_per_node(self):
+        calls = []
+        def run(cmd, **kwargs):
+            calls.append(cmd)
+            return types.SimpleNamespace(stdout="v26.13.0\n", returncode=0)
+        bootstrap._NODE_MAJORS.clear()
+        self.addCleanup(bootstrap._NODE_MAJORS.clear)
+        with mock.patch.object(bootstrap.subprocess, "run", run):
+            self.assertEqual(bootstrap.node_major("/x/node"), 26)
+            self.assertEqual(bootstrap.node_major("/x/node"), 26)
+            self.assertIsNone(bootstrap.node_major(None))
+        self.assertEqual(calls, [["/x/node", "--version"]])
+
+    def test_the_node_version_is_read(self):
+        self.assertEqual(doctor.node_major("v26.13.0"), 26)
+        self.assertEqual(doctor.node_major("v9.1.0\n"), 9)
+        self.assertIsNone(doctor.node_major("deno 2.9.7"))
+        self.assertIsNone(doctor.node_major(""))
 
 
 class UrlCheckReportTests(unittest.TestCase):
@@ -3482,7 +5910,10 @@ class FirstRunInstallTests(unittest.TestCase):
 
     def test_it_runs_the_installer_that_ships_with_the_release(self):
         (self.dir / "setup.ps1").write_text("x", encoding="utf-8")
-        cmd = firstrun.runtime_command(self.dir)
+        # platform given: on a Mac the installer is setup.sh (MacAppTests).
+        # Tester, 1.1: without it these two failed there, and build-mac.sh
+        # stopped before building.
+        cmd = firstrun.runtime_command(self.dir, platform="win32")
         self.assertIn("-RuntimeOnly", cmd)
         self.assertIn(str(self.dir / "setup.ps1"), cmd)
 
@@ -3490,10 +5921,14 @@ class FirstRunInstallTests(unittest.TestCase):
         # A profile that prints a banner or changes directory is not something
         # an installer should pick up.
         (self.dir / "setup.ps1").write_text("x", encoding="utf-8")
-        self.assertIn("-NoProfile", firstrun.runtime_command(self.dir))
+        self.assertIn("-NoProfile",
+                      firstrun.runtime_command(self.dir, platform="win32"))
 
     def test_no_installer_means_no_offer(self):
-        self.assertIsNone(firstrun.runtime_command(self.dir))
+        for platform in ("win32", "darwin"):
+            with self.subTest(platform):
+                self.assertIsNone(
+                    firstrun.runtime_command(self.dir, platform=platform))
 
     def test_it_is_only_offered_from_a_release(self):
         # From source, plain setup.ps1 is the right command and does more;
@@ -3579,7 +6014,8 @@ class ReleasePackagingTests(unittest.TestCase):
         # one of these may also be a copy into the build.
         source = self._build().read_text(encoding="utf-8")
         moves = ("Copy-Item", "Move-Item", "Compress-Archive", "New-Item")
-        for name in ("mpv-2.dll", "libmpv-2.dll", "deno.exe", "bgutil-pot.exe"):
+        for name in ("mpv-2.dll", "libmpv-2.dll", "deno.exe", "node.exe",
+                     "bgutil-pot.exe"):
             for line in source.splitlines():
                 stripped = line.lstrip()
                 if stripped.startswith(("#", "REM")) or name not in line:
@@ -3961,10 +6397,15 @@ class ProbeFlagTests(unittest.TestCase):
     setup that was working perfectly.
     """
 
-    def test_the_2_x_generator_is_asked_for_help_not_a_version(self):
+    def test_the_probe_asks_the_one_shot_script_not_the_server(self):
+        # Since 1.1 the probe runs build/generate_once.js, which does answer
+        # --version (it is what the plugin itself asks). main.js is the
+        # server and does not; asking it was the 0.9.x "unknown option".
         source = Path(potprovider.__file__).read_text(encoding="utf-8")
-        self.assertIn('probe_flag = "--help" if script.name == "main.ts" '
-                      'else "--version"', source)
+        body = source.split("def script_probe(")[1].split("\ndef ")[0]
+        self.assertIn("built_script(script_home)", body)
+        self.assertNotIn("built_server", body)
+        self.assertIn('"--version"', body)
 
     def test_the_probe_still_runs_the_thing_rather_than_looking_at_it(self):
         # A release once shipped a node_modules that existed, weighed half a
@@ -3978,8 +6419,8 @@ class ProbeFlagTests(unittest.TestCase):
         # The diagnostics have to report what the app will actually use.
         p = potprovider.PotProvider()
         self.assertIsNone(p.server_kind)
-        p._server_kind = "deno"
-        self.assertEqual(p.server_kind, "deno")
+        p._server_kind = "node"
+        self.assertEqual(p.server_kind, "node")
 
 
 class PrefetchLoggingTests(unittest.TestCase):
@@ -4034,8 +6475,9 @@ class VersionMatchedServerTests(unittest.TestCase):
     bgutil-pot.exe is a separate Rust port on its own numbering - it decoupled
     from upstream at 0.8.x - so against plugin 2.x the compatibility check
     refuses it, and the whole warm-server path silently reverted to spawning
-    deno per token. 2.0.0 merged the generator and the server into one main.ts,
-    so the server can now be that same file: version-matched by construction.
+    a runtime per token. 2.0.0 merged the generator and the server into one
+    main.ts, so the server can now be that same file: version-matched by
+    construction. Since 1.1 Node runs it compiled, as build/main.js.
     """
 
     def setUp(self):
@@ -4043,18 +6485,27 @@ class VersionMatchedServerTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.home = self.dir / "server"
         (self.home / "src").mkdir(parents=True)
-        self._which = potprovider.shutil.which
-        potprovider.shutil.which = lambda name: "/usr/bin/deno" if name == "deno" else None
-        self.addCleanup(setattr, potprovider.shutil, "which", self._which)
+        (self.home / "build").mkdir(parents=True)
+        self._find = potprovider.find_node
+        potprovider.find_node = lambda: "/usr/bin/node"
+        self.addCleanup(setattr, potprovider, "find_node", self._find)
 
-    def _generator(self, name):
+    def _generator(self, name, built=True):
         (self.home / "src" / name).write_text("x", encoding="utf-8")
+        if built and name == "main.ts":
+            (self.home / "build" / "main.js").write_text("x", encoding="utf-8")
 
     def test_a_2_x_tree_can_serve(self):
         self._generator("main.ts")
         cmd = potprovider.script_server_command(str(self.home))
         self.assertIsNotNone(cmd)
-        self.assertTrue(cmd[-1].endswith("main.ts"))
+        self.assertEqual(cmd[0], "/usr/bin/node")
+        self.assertEqual(Path(cmd[-1]).parts[-2:], ("build", "main.js"))
+
+    def test_an_unbuilt_2_x_tree_cannot(self):
+        # Node cannot run the TypeScript source; only tsc's output.
+        self._generator("main.ts", built=False)
+        self.assertIsNone(potprovider.script_server_command(str(self.home)))
 
     def test_a_1_x_tree_cannot(self):
         # generate_once.ts answers one request and exits - running it as a
@@ -4062,23 +6513,82 @@ class VersionMatchedServerTests(unittest.TestCase):
         self._generator("generate_once.ts")
         self.assertIsNone(potprovider.script_server_command(str(self.home)))
 
-    def test_no_deno_means_no_server(self):
+    def test_no_node_means_no_server(self):
         self._generator("main.ts")
-        potprovider.shutil.which = lambda name: None
+        potprovider.find_node = lambda: None
         self.assertIsNone(potprovider.script_server_command(str(self.home)))
 
-    def test_it_runs_with_the_same_permissions_as_the_plugin_would(self):
-        # Scoped, not --allow-all: this is third-party TypeScript either way.
+    def test_it_runs_inside_node_s_permission_model(self):
+        # Third-party JavaScript. deno limited its file access; Node does not
+        # unless asked. Read its own tree and the cache, write the cache only.
         self._generator("main.ts")
         cmd = potprovider.script_server_command(str(self.home))
-        self.assertIn("--allow-net", cmd)
-        self.assertNotIn("--allow-all", cmd)
-        self.assertTrue(any(a.startswith("--allow-ffi=") for a in cmd))
+        node_flags = cmd[1:cmd.index(cmd[-1])]
+        self.assertEqual(node_flags[0], "--permission")
+        cache = potprovider.script_cache_dir(str(self.home))
+        self.assertIn(f"--allow-fs-read={os.path.abspath(str(self.home))}",
+                      node_flags)
+        self.assertIn(f"--allow-fs-write={cache}", node_flags)
+        writes = [a for a in node_flags if a.startswith("--allow-fs-write=")]
+        self.assertEqual(writes, [f"--allow-fs-write={cache}"])
+        for wide in ("--allow-child-process", "--allow-addons",
+                     "--allow-worker", "--allow-wasi"):
+            self.assertFalse(any(a.startswith(wide) for a in node_flags), wide)
+        self.assertFalse(any(a.endswith("=*") for a in node_flags))
 
-    def test_the_deno_server_needs_no_version_check(self):
+    def test_node_25_and_newer_get_network_access(self):
+        # K's first run on Node 26: "Access to this API has been restricted.
+        # Use --allow-net" - the server exited and script mode took over.
+        for major in (25, 26, None):
+            with self.subTest(major=major):
+                self.assertIn("--allow-net",
+                              potprovider.server_args(str(self.home), major))
+
+    def test_only_the_experimental_warning_is_silenced(self):
+        # K's log on Node 26: "ExperimentalWarning: The flag --allow-net is
+        # under experimental phase" on every start. Other warnings stay.
+        args = potprovider.server_args(str(self.home), 26)
+        self.assertIn("--disable-warning=ExperimentalWarning", args)
+        self.assertFalse(any(a == "--no-warnings" for a in args))
+        self.assertNotIn("--disable-warning=ExperimentalWarning",
+                         potprovider.server_args(str(self.home), 22))
+
+    def test_older_node_is_not_given_a_flag_it_refuses(self):
+        # Node 22 to 24 do not limit the network and do not know the flag.
+        for major in (22, 24):
+            with self.subTest(major=major):
+                self.assertNotIn("--allow-net",
+                                 potprovider.server_args(str(self.home), major))
+
+    def test_the_server_command_asks_the_version_of_its_own_node(self):
+        self._generator("main.ts")
+        asked = []
+        with mock.patch.object(potprovider, "node_major",
+                               lambda node: asked.append(node) or 22):
+            cmd = potprovider.script_server_command(str(self.home))
+        self.assertEqual(asked, ["/usr/bin/node"])
+        self.assertNotIn("--allow-net", cmd)
+
+    def test_every_allowed_path_is_its_own_flag(self):
+        # Node 23 stopped splitting on commas: "a,b" would be one path.
+        self._generator("main.ts")
+        cmd = potprovider.script_server_command(str(self.home))
+        for arg in cmd:
+            if arg.startswith("--allow-fs-"):
+                self.assertNotIn(",", arg.split("=", 1)[1].replace(
+                    str(self.home), "").replace(
+                    potprovider.script_cache_dir(str(self.home)), ""))
+
+    def test_a_sandbox_refusal_is_named_in_the_log(self):
+        source = Path(potprovider.__file__).read_text(encoding="utf-8")
+        body = source.split("def _start_server_locked")[1].split("def stop")[0]
+        self.assertIn("SANDBOX_REFUSED", body)
+        self.assertEqual(potprovider.ACCESS_DENIED, "ERR_ACCESS_DENIED")
+
+    def test_the_node_server_needs_no_version_check(self):
         # There is no pair of versions to compare - it is the same release.
         p = potprovider.PotProvider()
-        p._server_kind = "deno"
+        p._server_kind = "node"
         self.assertTrue(p.compatible())
 
     def test_the_exe_is_still_version_checked(self):
@@ -4100,10 +6610,10 @@ class VersionMatchedServerTests(unittest.TestCase):
         self.assertIn("Script mode will be used instead.", body)
 
     def test_stopping_forgets_which_kind_was_running(self):
-        # Otherwise compatible() would keep answering True for a deno server
+        # Otherwise compatible() would keep answering True for a Node server
         # that is no longer there.
         p = potprovider.PotProvider()
-        p._server_kind = "deno"
+        p._server_kind = "node"
         p.stop()
         self.assertIsNone(p._server_kind)
 
@@ -4155,12 +6665,13 @@ class GeneratorEntryPointTests(unittest.TestCase):
         # "generate_once.ts is missing" sent someone looking for a file that
         # their release was never supposed to have.
         # The real one: the suite replaces script_probe with a stub so no test
-        # ever shells out to deno.
-        ok, detail = _REAL_SCRIPT_PROBE(str(self.dir / "server"))
+        # ever shells out to Node. Node must look present, or the probe stops
+        # at "not found" before it looks at the tree.
+        with mock.patch.object(potprovider, "find_node", lambda: "node.exe"):
+            ok, detail = _REAL_SCRIPT_PROBE(str(self.dir / "server"))
         self.assertFalse(ok)
-        if "deno" not in detail:
-            self.assertIn("main.ts", detail)
-            self.assertIn("generate_once.ts", detail)
+        self.assertIn("main.ts", detail)
+        self.assertIn("generate_once.ts", detail)
 
     def test_nothing_still_hardcodes_the_old_name(self):
         source = Path(potprovider.__file__).read_text(encoding="utf-8")
@@ -4861,9 +7372,9 @@ class ReleaseHelperScriptTests(unittest.TestCase):
         source = self._build()
         made = source.split("Adding the helper scripts")[1].split(
             "Adding the documents")[0]
-        self.assertIn("ChuuTube2Spout.exe --doctor", made)
-        self.assertIn("ChuuTube2Spout.exe --check %*", made)
-        self.assertIn("ChuuTube2Spout.exe --clear-cache", made)
+        self.assertIn("ChuuTubePoi.exe --doctor", made)
+        self.assertIn("ChuuTubePoi.exe --check %*", made)
+        self.assertIn("ChuuTubePoi.exe --clear-cache", made)
         self.assertNotIn(".venv", made)
         self.assertNotIn("run.py", made)
 
@@ -5079,11 +7590,17 @@ class RoadmapStaysInternalTests(unittest.TestCase):
         return Path(__file__).resolve().parent.parent
 
     def test_the_roadmap_exists_to_be_kept_out_of(self):
+        if not (self._root() / ".git").exists():
+            # A copy of the source without the working notes - the Mac build
+            # zip for the tester (1.1) - is what this is about, not a fault.
+            self.skipTest("not a checkout: the working notes stay at home")
         self.assertTrue((self._root() / "ROADMAP.md").is_file())
 
     def test_the_build_does_not_copy_it(self):
-        source = (self._root() / "build.ps1").read_text(encoding="utf-8")
-        self.assertNotIn("ROADMAP", source)
+        for script in ("build.ps1", "build-mac.sh"):
+            with self.subTest(script):
+                source = (self._root() / script).read_text(encoding="utf-8")
+                self.assertNotIn("ROADMAP", source)
 
     def test_the_documents_it_does_copy_are_the_public_ones(self):
         source = (self._root() / "build.ps1").read_text(encoding="utf-8")
@@ -6022,7 +8539,7 @@ class IdleSenderTests(unittest.TestCase):
         self.assertIn("_idle.destroy()", body)
 
     def test_it_can_be_switched_off(self):
-        from chuutube2spout import config
+        from chuutubepoi import config
         self.assertTrue(config.IDLE_SENDERS,
                         "on by default - it is what makes the app patchable")
 
@@ -6228,7 +8745,7 @@ class SpoutCanvasTests(unittest.TestCase):
         reloaded module reads the RESTORED values once the block ends - which
         silently turned every one of these into a test of the defaults.
         """
-        keys = {f"CHUUTUBE2SPOUT_{k}": str(v) for k, v in settings.items()}
+        keys = {f"CHUUTUBEPOI_{k}": str(v) for k, v in settings.items()}
         try:
             with mock.patch.dict(os.environ, keys, clear=False):
                 yield importlib.reload(config)
@@ -6516,7 +9033,7 @@ class SenderBackgroundTests(unittest.TestCase):
 
     @contextlib.contextmanager
     def _settings(self, **settings):
-        keys = {f"CHUUTUBE2SPOUT_{k}": str(v) for k, v in settings.items()}
+        keys = {f"CHUUTUBEPOI_{k}": str(v) for k, v in settings.items()}
         try:
             with mock.patch.dict(os.environ, keys, clear=False):
                 yield importlib.reload(config)
@@ -6774,11 +9291,12 @@ class ReleaseGuardTests(unittest.TestCase):
                 / "setup.ps1").read_text(encoding="utf-8")
 
     def test_the_runtime_cannot_be_published_by_accident(self):
-        # Not shipping libmpv, deno and the token generator is the whole basis
-        # of THIRD-PARTY-NOTICES.md. A -Portable run or a first-run install
-        # done from dist\ puts them there.
+        # Not shipping libmpv, Node.js and the token generator is the whole
+        # basis of THIRD-PARTY-NOTICES.md. A first-run install done from dist\
+        # puts them there. deno.exe stays listed: a folder from before 1.1
+        # still has one.
         build = self._build()
-        for name in ("mpv-2.dll", "libmpv-2.dll", "deno.exe",
+        for name in ("mpv-2.dll", "libmpv-2.dll", "deno.exe", "node",
                      "bgutil-pot.exe", "bgutil-server"):
             with self.subTest(name):
                 self.assertIn(f'Path = "{name}"', build)
@@ -6811,15 +9329,34 @@ class ReleaseGuardTests(unittest.TestCase):
         # missing contradicts the folder it describes, and the publish step
         # that says "fetch those by hand" can never be finished.
         setup = self._setup()
-        body = setup.split("$missing += ")[0].rsplit("} else {", 1)[1]
-        self.assertIn('"$($info.Name).txt"', body)
+        body = setup.split("$missing += ")[0].rsplit("$files = @()", 1)[1]
+        self.assertIn('$candidates = @("$($info.Name).txt")', body)
         self.assertIn("Test-Path (Join-Path $licDir $candidate)", body)
+        # Looked for even when the wheel has a text: PySide6 (1.1).
+        self.assertLess(body.index("if ($info.Text)"),
+                        body.index("foreach ($candidate in $candidates)"))
+        self.assertNotIn("} else {\n            $file", body)
 
-    def test_a_hand_fetched_licence_still_says_so(self):
-        # "the wheel shipped this" and "a person fetched this" are different
+    def test_a_project_licence_still_says_so(self):
+        # "the wheel shipped this" and "fetched from the project" are different
         # claims, and a generated inventory that blurs them is worth less than
         # one that does not exist.
-        self.assertIn("(fetched by hand)", self._setup())
+        self.assertIn("(from the project)", self._setup())
+
+    def test_setup_fetches_the_texts_the_wheels_lack(self):
+        # The PySide6 wheels for Windows carry only the Qt commercial notice;
+        # PyOpenGL and the bgutil plugin carry none (1.1).
+        setup = self._setup()
+        block = setup.split("$packageTexts = [ordered]@{")[1].split("}")[0]
+        for name in ("bgutil-ytdlp-pot-provider", "PyOpenGL", "PySide6",
+                     "PySide6_Addons", "PySide6_Essentials", "PySide6_Pdf",
+                     "PySide6_WebEngine", "shiboken6"):
+            self.assertIn(f'"{name}"', block)
+        self.assertIn("LGPL-3.0-only.txt", setup.split("$qtLgpl = ")[1].splitlines()[0])
+        loop = setup.split("foreach ($pkg in $packageTexts.Keys) {")[1].split(
+            'Say "Reading licences')[0]
+        self.assertIn("if (Test-Path $out) { continue }", loop)
+        self.assertIn("Assert-TrustedUrl $packageTexts[$pkg]", loop)
 
 
 class FaulthandlerSafetyTests(unittest.TestCase):
@@ -7057,7 +9594,7 @@ class RedactionVersionPathTests(unittest.TestCase):
     """A four-part version after a URL-encoded space is not an IP address."""
 
     def test_the_testers_path_survives(self):
-        line = ("file:///Y:/VJ/TOOLS/ChuuTube2Spout/ChuuTube2Spout%200.9.9.11"
+        line = ("file:///Y:/VJ/TOOLS/ChuuTubePoi/ChuuTubePoi%200.9.9.11"
                 "/bgutil-server/x/server/src/main.ts:4:21")
         self.assertEqual(redact.scrub(line), line)
 
@@ -7083,7 +9620,7 @@ class TokenServerDriveTests(unittest.TestCase):
         self.dir = Path(tempfile.mkdtemp(prefix="chuutube-pot-"))
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.app = self.dir / "app"
-        self.local = self.dir / "local" / "ChuuTube2Spout" / "bgutil-server"
+        self.local = self.dir / "local" / "ChuuTubePoi" / "bgutil-server"
         self.saved = {name: getattr(potprovider, name) for name in (
             "project_root", "local_server_root", "script_probe",
             "install_script_deps")}
@@ -7105,9 +9642,19 @@ class TokenServerDriveTests(unittest.TestCase):
         (server / "package.json").write_text("{}")
         if built or ready:
             (server / "node_modules").mkdir(exist_ok=True)
+            (server / "build").mkdir(exist_ok=True)
+            for name in ("main.js", "generate_once.js"):
+                (server / "build" / name).write_text("// tsc output")
         if ready:
             (server / "node_modules" / potprovider.READY_MARKER).write_text("ok")
         return server
+
+    def test_a_tree_deno_proved_is_not_ready_for_node(self):
+        # The first start after 1.1: deno's marker is there, Node's build is
+        # not. Taken as ready, it would win over every other tree.
+        server = self._tree(self.app / "bgutil-server", ready=True)
+        shutil.rmtree(server / "build")
+        self.assertFalse(potprovider.is_ready(server))
 
     # --- which tree -------------------------------------------------------
     def test_a_proven_tree_beats_an_unproven_one_wherever_it_is(self):
@@ -7116,7 +9663,7 @@ class TokenServerDriveTests(unittest.TestCase):
         self.assertEqual(potprovider.find_script_home(), str(local))
 
     def test_node_modules_alone_is_not_proof(self):
-        # A deno install that dies half way leaves one behind.
+        # An install that dies half way leaves one behind.
         server = self._tree(self.app / "bgutil-server", built=True)
         self.assertFalse(potprovider.is_ready(server))
 
@@ -7166,6 +9713,9 @@ class TokenServerDriveTests(unittest.TestCase):
             ok, detail = next(results)
             if ok:
                 (Path(home) / "node_modules").mkdir(exist_ok=True)
+                (Path(home) / "build").mkdir(exist_ok=True)
+                for name in ("main.js", "generate_once.js"):
+                    (Path(home) / "build" / name).write_text("// tsc output")
             return ok, detail
 
         def probe(home):
@@ -7246,9 +9796,9 @@ class TokenServerDriveTests(unittest.TestCase):
     def test_an_unbuilt_tree_is_not_started_as_a_server(self):
         self._tree(self.app / "bgutil-server")
         provider = potprovider.PotProvider()
-        # deno must LOOK present, or script_server_command returns None for
+        # Node must LOOK present, or script_server_command returns None for
         # want of it and this passes without testing the readiness check.
-        with mock.patch.object(potprovider.shutil, "which", lambda n: "deno"), \
+        with mock.patch.object(potprovider, "find_node", lambda: "node"), \
              mock.patch.object(potprovider, "port_is_open", lambda *a, **k: False), \
              mock.patch.object(potprovider, "find_executable", lambda: None), \
              mock.patch.object(potprovider.subprocess, "Popen") as popen:
@@ -7262,15 +9812,29 @@ class TokenServerDriveTests(unittest.TestCase):
         self._tree(self.app / "bgutil-server")
         provider = potprovider.PotProvider()
         out = io.StringIO()
-        # deno must LOOK present, or script_server_command returns None for
+        # Node must LOOK present, or script_server_command returns None for
         # want of it and this passes without testing the readiness check.
-        with mock.patch.object(potprovider.shutil, "which", lambda n: "deno"), \
+        with mock.patch.object(potprovider, "find_node", lambda: "node"), \
              mock.patch.object(potprovider, "port_is_open", lambda *a, **k: False), \
              mock.patch.object(potprovider, "find_executable", lambda: None), \
              contextlib.redirect_stderr(out):
             provider._start_server()
         self.assertEqual(out.getvalue(), "")
         self.assertIn("not prepared yet", provider.status)
+
+    def test_a_working_script_mode_is_not_called_unbuilt(self):
+        # K's log: "its dependencies could not be built" on a setup whose
+        # script mode had just reported ready - only the server had failed.
+        self._tree(self.app / "bgutil-server", ready=True)
+        provider = potprovider.PotProvider()
+        provider._script_ok = True
+        out = io.StringIO()
+        with mock.patch.object(potprovider, "find_node", lambda: None), \
+             mock.patch.object(potprovider, "find_executable", lambda: None), \
+             contextlib.redirect_stderr(out):
+            provider._start_server()
+        self.assertIn("script mode issues the tokens", out.getvalue())
+        self.assertNotIn("could not be built", out.getvalue())
 
     def test_a_tree_that_could_not_be_built_says_so_accurately(self):
         self._tree(self.app / "bgutil-server")
@@ -7286,35 +9850,118 @@ class TokenServerDriveTests(unittest.TestCase):
                          "re-running setup does not fix a drive")
 
 
-class SetupDenoInstallTests(unittest.TestCase):
-    """setup.ps1 must not report a half-built generator as installed."""
+class SetupNodeTests(unittest.TestCase):
+    """setup.ps1 since 1.1: Node.js from nodejs.org, the generator built with it."""
 
     @staticmethod
-    def _block() -> str:
-        source = (Path(__file__).resolve().parent.parent
-                  / "setup.ps1").read_text(encoding="utf-8")
-        return source.split("Installing the generator's dependencies")[1] \
+    def _setup() -> str:
+        return (Path(__file__).resolve().parent.parent
+                / "setup.ps1").read_text(encoding="utf-8")
+
+    def _section(self, title: str) -> str:
+        source = self._setup()
+        return source.split(title)[1].split("\n# ---")[0]
+
+    def _build_block(self) -> str:
+        source = self._setup()
+        return source.split("# Node.js runs the generator compiled")[1] \
                      .split("# ---")[0]
 
-    def test_success_is_the_exit_code_not_the_folder(self):
-        # deno creates node_modules before it fails half way through, so the
-        # folder existing said "installed" on a drive where nothing resolved.
-        block = self._block()
-        self.assertIn("if ($denoExit -eq 0) {", block)
-        self.assertNotIn('if (Test-Path (Join-Path $serverDir "node_modules")) {',
-                         block)
+    # --- Node.js itself -----------------------------------------------------
+    def test_node_is_pinned_and_its_checksum_is_recorded(self):
+        source = self._setup()
+        pin = re.search(r'Node\s*=\s*@\{\s*Version = "(\d+\.\d+\.\d+)"\s*\n'
+                        r'\s*Name = "([^"]+)"', source)
+        self.assertIsNotNone(pin)
+        version, name = pin.groups()
+        self.assertEqual(name, f"node-v{version}-win-x64.zip")
+        sums = (Path(__file__).resolve().parent.parent / "checksums.txt"
+                ).read_text(encoding="utf-8")
+        self.assertRegex(sums, rf"(?m)^[0-9a-f]{{64}}\s+{re.escape(name)}$")
 
-    def test_a_drive_that_cannot_link_is_explained_not_retried(self):
-        block = self._block()
-        self.assertIn("-not $linkFailure", block)
-        self.assertIn("Incorrect function", block)
-        self.assertIn("LOCALAPPDATA", block)
+    def test_the_pinned_node_is_new_enough_for_the_plugin(self):
+        source = self._setup()
+        major = int(re.search(r'Node\s*=\s*@\{\s*Version = "(\d+)\.',
+                              source).group(1))
+        self.assertGreaterEqual(major, bootstrap.NODE_MIN_MAJOR)
 
-    def test_setup_and_the_app_agree_on_what_a_link_failure_looks_like(self):
-        # Two lists of the same words are how one of them drifts.
-        for word in potprovider.LINK_FAILURE:
-            with self.subTest(word):
-                self.assertIn(word, self._block().lower())
+    def test_node_comes_from_nodejs_org_and_only_that_host_is_added(self):
+        source = self._setup()
+        self.assertIn('Get-Verified "https://nodejs.org/dist/v$($nodePin.Version)/'
+                      '$($nodePin.Name)"', source)
+        trusted = source.split("function Assert-TrustedUrl")[1].split("\n}")[0]
+        self.assertIn("nodejs\\.org", trusted)
+        self.assertNotIn("npmjs", trusted)
+
+    def test_node_goes_where_the_app_looks_for_it(self):
+        node = self._section("# ------------------------------------------------------------------ node -----")
+        self.assertIn('$nodeDir = Join-Path $Root "node"', node)
+        self.assertEqual(bootstrap.NODE_DIR, "node")
+        self.assertIn('Join-Path $nodeDir "node.exe"', node)
+        self.assertIn("node_modules\\npm\\bin\\npm-cli.js", node)
+
+    def test_a_node_on_path_is_not_relied_on(self):
+        node = self._section("# ------------------------------------------------------------------ node -----")
+        self.assertNotIn("Get-Command node", node)
+
+    def test_the_folder_is_copied_not_moved_across_drives(self):
+        node = self._section("# ------------------------------------------------------------------ node -----")
+        self.assertIn("Copy-Item -Recurse $inner.FullName $nodeDir", node)
+        code = "\n".join(line for line in node.splitlines()
+                         if not line.lstrip().startswith("#"))
+        self.assertNotIn("Move-Item", code)
+
+    # --- the generator build ------------------------------------------------
+    def test_every_npm_call_is_ci_without_scripts(self):
+        block = self._build_block()
+        calls = [line for line in block.splitlines()
+                 if "$npmCli" in line and "&" in line]
+        self.assertEqual(len(calls), 2, "one attempt and one retry")
+        for line in calls:
+            with self.subTest(line=line.strip()):
+                self.assertIn("$npmCli ci --ignore-scripts", line)
+                self.assertNotIn(" install", line)
+
+    def test_setup_and_the_app_run_npm_the_same_way(self):
+        # Two copies of one command are how one of them drifts.
+        app = potprovider.npm_ci_command("node", "npm-cli.js")[2:]
+        block = self._build_block()
+        self.assertIn("$npmCli " + " ".join(app), block)
+
+    def test_success_is_the_built_files_not_an_exit_code_or_a_folder(self):
+        block = self._build_block()
+        self.assertIn("if (Test-GeneratorBuilt) {", block)
+        source = self._setup()
+        built = source.split("function Test-GeneratorBuilt")[1].split("\n}")[0]
+        self.assertIn("$builtServer", built)
+        self.assertIn("$builtScript", built)
+        self.assertIn('"build\\main.js"', source)
+        self.assertIn('"build\\generate_once.js"', source)
+        self.assertEqual((potprovider.BUILD_DIR, potprovider.BUILT_SERVER,
+                          potprovider.BUILT_SCRIPT),
+                         ("build", "main.js", "generate_once.js"))
+
+    def test_tsc_runs_only_after_npm_ci_worked(self):
+        block = self._build_block()
+        self.assertLess(block.index("if ($npmExit -eq 0) {"),
+                        block.index("& $nodeExe $tsc"))
+
+    def test_the_script_mode_verdict_needs_the_build(self):
+        source = self._setup()
+        verdict = source.split("$scriptModeReady =")[1].split("\n\n")[0]
+        self.assertIn("Test-GeneratorBuilt", verdict)
+
+    def test_no_deno_left_in_what_setup_runs(self):
+        code = "\n".join(line for line in self._setup().splitlines()
+                         if not line.lstrip().startswith("#")
+                         and "Say " not in line)
+        self.assertNotIn("$denoCmd", code)
+        self.assertNotIn("denoland", code)
+
+    def test_setup_is_still_plain_ascii(self):
+        raw = (Path(__file__).resolve().parent.parent / "setup.ps1").read_bytes()
+        raw.decode("ascii")
+        self.assertFalse(raw.startswith(b"\xef\xbb\xbf"))
 
 
 class JoinedPrefetchPartialTests(unittest.TestCase):
@@ -7731,7 +10378,7 @@ class ArchiveContainmentTests(unittest.TestCase):
             with self.subTest(line=i + 1, code=code):
                 self.assertIn("Assert-SafeEntries", before)
                 self.assertIn("Assert-NoLinks", after)
-        self.assertEqual(found, 4, "tar, 7zr, deno's zip and the generator's zip")
+        self.assertEqual(found, 4, "tar, 7zr, Node's zip and the generator's zip")
 
     # --- behaviour, in a real PowerShell -------------------------------------
     def test_entry_names_that_leave_the_folder_are_unsafe(self):
@@ -7834,7 +10481,7 @@ class ArchiveContainmentTests(unittest.TestCase):
         block = source[source.index("# ----------------------------"
                                     "------------------------------------ libmpv"):
                        source.index("# ----------------------------"
-                                    "-------------------------------------- deno")]
+                                    "-------------------------------------- node")]
         (Path(self.tmp) / "block.ps1").write_text(block, encoding="utf-8")
         root = Path(self.tmp) / "app"
         root.mkdir()
@@ -8118,7 +10765,7 @@ class MpvFallbackTests(unittest.TestCase):
         block = source[source.index("# ------------------------------------"
                                     "---------------------------- libmpv"):
                        source.index("# ------------------------------------"
-                                    "------------------------------ deno")]
+                                    "------------------------------ node")]
         root = self.tmp / "app"
         root.mkdir()
         (root / "checksums.txt").write_text(
@@ -8473,12 +11120,133 @@ class ShortcutDocsTests(unittest.TestCase):
                     self.assertIn(f"`{self.NAMES.get(key, key)}`", section)
 
     def test_the_help_dialog_lists_them(self):
-        source = Path(ui_mod.__file__).read_text(encoding="utf-8")
-        body = source.split("def _show_help")[1].split("\n    def ")[0]
+        text = ui_mod.keyboard_help("win32")
         for seq in self._shortcuts():
+            if seq == "Ctrl+Left":
+                continue                     # Mac only, see below
             for key in seq.split("+"):
                 with self.subTest(seq):
-                    self.assertIn(self.NAMES.get(key, key), body)
+                    self.assertIn(self.NAMES.get(key, key), text)
+
+    def test_on_a_mac_it_names_the_mac_keys(self):
+        # K, 1.1: Ctrl+1 is ⌘1 there, and a Mac keyboard has no Home key.
+        text = ui_mod.keyboard_help("darwin")
+        self.assertIn("⌘1 / ⌘2", text)
+        self.assertIn("⌘←", text)
+        self.assertNotIn("Ctrl", text)
+        self.assertNotIn("Home", text)
+
+    def test_the_mac_gets_command_left_for_back_to_start(self):
+        source = Path(ui_mod.__file__).read_text(encoding="utf-8")
+        body = source.split("def _install_shortcuts")[1].split("\n    def ")[0]
+        mac = body.split('if sys.platform == "darwin":')[1].split("add(\"Ctrl+1\"")[0]
+        self.assertIn('add("Ctrl+Left", lambda: self.panels[self.selected_index]'
+                      '.jump_to_start())', mac)
+
+    def test_help_shows_these_keys(self):
+        source = Path(ui_mod.__file__).read_text(encoding="utf-8")
+        body = source.split("def _show_help")[1].split("\n    def ")[0]
+        self.assertIn("keyboard_help()", body)
+
+    def test_esc_and_enter_are_documented(self):
+        readme = (Path(__file__).resolve().parent.parent / "README.md"
+                  ).read_text(encoding="utf-8")
+        section = readme.split("### Keyboard")[1].split("\n#")[0]
+        self.assertIn("`Esc`", section)
+        self.assertIn("`⌘`", section)
+        self.assertIn("Esc", ui_mod.keyboard_help("win32"))
+
+
+class WorthFetchingTests(unittest.TestCase):
+    """Fetching ahead only for links, not for stray keys (tester, 1.1)."""
+
+    def test_links(self):
+        for text in ("https://www.youtube.com/watch?v=gcw3FDCFWi8",
+                     "youtu.be/gcw3FDCFWi8", "www.youtube.com/watch?v=x",
+                     "rtmp://host/live", "  https://x.y/z  "):
+            with self.subTest(text):
+                self.assertTrue(ui_mod.worth_fetching(text))
+
+    def test_not_links(self):
+        for text in ("", " ", "1", "2", "f", "F", "m", "12", "hello",
+                     "youtube", "watch?v=x"):
+            with self.subTest(text):
+                self.assertFalse(ui_mod.worth_fetching(text))
+
+    def test_a_file_that_is_there(self):
+        tmp = Path(tempfile.mkdtemp(prefix="chuutube-file-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        clip = tmp / "clip.mp4"
+        clip.write_bytes(b"x")
+        self.assertTrue(ui_mod.worth_fetching(str(clip)))
+        self.assertFalse(ui_mod.worth_fetching(str(tmp / "missing.mp4")))
+
+    def test_the_prefetch_asks_first(self):
+        source = Path(ui_mod.__file__).read_text(encoding="utf-8")
+        body = source.split("def _prefetch_now")[1].split("\n    def ")[0]
+        self.assertIn("if worth_fetching(url):", body)
+
+
+class LeaveTheUrlFieldTests(unittest.TestCase):
+    """Esc gives the keyboard back to the shortcuts (K, 1.1)."""
+
+    class _Key:
+        def __init__(self, key):
+            self._key = key
+            self.accepted = False
+        def key(self):
+            return self._key
+        def accept(self):
+            self.accepted = True
+
+    LINK = "https://www.youtube.com/watch?v=x"
+
+    def _arrived(self, text):
+        edit = ui_mod.UrlEdit()
+        calls = []
+        edit.clearFocus = lambda: calls.append("clearFocus")
+        edit.deselect = lambda: calls.append("deselect")
+        edit.setText(text)
+        with mock.patch.object(ui_mod.QLineEdit, "focusInEvent",
+                               lambda self, e: None, create=True):
+            edit.focusInEvent(None)
+        return edit, calls
+
+    def test_esc_leaves_and_keeps_an_untouched_link(self):
+        edit, calls = self._arrived(self.LINK)
+        event = self._Key(ui_mod.Qt.Key_Escape)
+        edit.keyPressEvent(event)
+        self.assertTrue(event.accepted)
+        self.assertIn("clearFocus", calls)
+        self.assertEqual(edit.text(), self.LINK)
+
+    def test_esc_undoes_a_key_typed_over_the_link(self):
+        # Tester, 1.1: arriving selects all, so "1" for slot A replaced the
+        # link - and was fetched as one.
+        edit, calls = self._arrived(self.LINK)
+        edit.setText("1")
+        edit.keyPressEvent(self._Key(ui_mod.Qt.Key_Escape))
+        self.assertEqual(edit.text(), self.LINK)
+        self.assertIn("clearFocus", calls)
+
+    def test_other_keys_still_type(self):
+        edit = ui_mod.UrlEdit()
+        calls = []
+        edit.clearFocus = lambda: calls.append("clearFocus")
+        event = self._Key(ui_mod.Qt.Key_A)
+        typed = []
+        with mock.patch.object(ui_mod.QLineEdit, "keyPressEvent",
+                               lambda self, e: typed.append(e), create=True):
+            edit.keyPressEvent(event)
+        self.assertEqual(typed, [event], "handed to the field as usual")
+        self.assertEqual(calls, [])
+        self.assertFalse(event.accepted)
+
+    def test_enter_loads_then_leaves(self):
+        source = Path(ui_mod.__file__).read_text(encoding="utf-8")
+        load = source.index("self.url_edit.returnPressed.connect(self.load)")
+        leave = source.index("self.url_edit.returnPressed.connect(self.url_edit.leave)")
+        self.assertLess(load, leave)
 
 
 
@@ -8739,7 +11507,7 @@ class EmptySlotTransparencyTests(unittest.TestCase):
 
     @contextlib.contextmanager
     def _settings(self, **settings):
-        keys = {f"CHUUTUBE2SPOUT_{k}": str(v) for k, v in settings.items()}
+        keys = {f"CHUUTUBEPOI_{k}": str(v) for k, v in settings.items()}
         try:
             with mock.patch.dict(os.environ, keys, clear=False):
                 yield importlib.reload(config)
@@ -8972,7 +11740,7 @@ class WindowFloorTests(unittest.TestCase):
         self.assertEqual(self.minimums, [])
 
     def test_the_url_row_has_hard_minimums(self):
-        from chuutube2spout import theme
+        from chuutubepoi import theme
         sheet = theme.STYLESHEET
         for role in ("paste", "load", "clear"):
             with self.subTest(role=role):
@@ -9060,7 +11828,7 @@ class WindowWidthTests(unittest.TestCase):
         for raw, want in (("1600", 1600), ("1600.0", 1600), ("", 0),
                           ("wide", 0), ("-5", 0), ("99999", 16384)):
             with self.subTest(raw=raw), \
-                    _env(CHUUTUBE2SPOUT_WINDOW_WIDTH=raw):
+                    _env(CHUUTUBEPOI_WINDOW_WIDTH=raw):
                 self.assertEqual(config._window_width(), want)
 
 
@@ -9153,7 +11921,7 @@ class ModalLoopTickTests(unittest.TestCase):
             return 1
 
     def setUp(self):
-        from chuutube2spout import modalloop
+        from chuutubepoi import modalloop
         self.m = modalloop
         self.user32 = self._User32()
         self.ticks = []
@@ -9348,7 +12116,7 @@ class HeldTickTests(unittest.TestCase):
         self.assertEqual(self.s.set_held(False), 0, "reset after reporting")
 
     def test_the_log_line_carries_the_frame_count(self):
-        from chuutube2spout import modalloop
+        from chuutubepoi import modalloop
 
         class _U:
             SetTimer = staticmethod(lambda *a: 1)
@@ -9389,7 +12157,7 @@ class TitlePressTests(unittest.TestCase):
             return -32768 if self.button_down else 0
 
     def setUp(self):
-        from chuutube2spout import modalloop
+        from chuutubepoi import modalloop
         self.m = modalloop
         self.u = self._User32()
         self.ticks = []
@@ -9451,7 +12219,7 @@ class QtMessageTests(unittest.TestCase):
         "maxtrack=POINT(x=0, y=0), mintrack=POINT(x=636, y=417)))")
 
     def setUp(self):
-        from chuutube2spout import qtmessages
+        from chuutubepoi import qtmessages
         self.q = qtmessages
 
     def test_the_testers_line_becomes_a_labelled_note(self):
@@ -9475,7 +12243,7 @@ class QtMessageTests(unittest.TestCase):
     def test_installed_before_the_qapplication(self):
         source = Path(app_mod.__file__).read_text(encoding="utf-8") \
             if "app_mod" in globals() else \
-            (ROOT / "chuutube2spout" / "app.py").read_text(encoding="utf-8")
+            (ROOT / "chuutubepoi" / "app.py").read_text(encoding="utf-8")
         self.assertLess(source.index("install_qt_messages()"),
                         source.index("app = QApplication(argv)"))
 
@@ -9484,7 +12252,7 @@ class QtNoteInSetupWindowTests(unittest.TestCase):
     """The note also reaches the setup window, not only the log (K)."""
 
     def setUp(self):
-        from chuutube2spout import qtmessages
+        from chuutubepoi import qtmessages
         self.q = qtmessages
         self.seen = []
         self.q.add_listener(self.seen.append)
@@ -9511,7 +12279,7 @@ class QtNoteInSetupWindowTests(unittest.TestCase):
         self.assertEqual(len(self.seen), 1)
 
     def test_the_setup_window_listens_only_while_open(self):
-        source = (ROOT / "chuutube2spout" / "firstrun.py").read_text(
+        source = (ROOT / "chuutubepoi" / "firstrun.py").read_text(
             encoding="utf-8")
         body = source.split("qtmessages.add_listener(forward)")[1]
         self.assertIn("dialog.exec()", body.split("finally:")[0])
@@ -9561,6 +12329,48 @@ class StaleResumeTests(unittest.TestCase):
         self.assertIn("--no-continue", args)
         self.assertNotIn("player_client=mweb", args,
                          "same client as the first try, not the next one")
+
+
+class StaleResumeFromCachedDescriptionTests(StaleResumeTests):
+    """The same 416, met while replaying a cached description (1.0.12).
+
+    Tester, 1.0.11: the retry "from the start" lost its --no-continue on this
+    path, resumed the same finished file into the same 416, and only the full
+    extraction after it got the clip.
+    """
+
+    def setUp(self):
+        super().setUp()
+        info = Path(self.cache) / ".info-test.info.json"
+        info.write_text("{}", encoding="utf-8")
+        p = mock.patch.object(downloader, "fresh_info", lambda *a: info)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_restarts_the_same_client_from_zero_at_once(self):
+        result = downloader.download("https://example/watch", 1080, self.cache)
+        self.assertTrue(result.video_path.endswith("clip.f137.mp4"))
+        invocations = int((Path(self.cache) / "_invocations").read_text())
+        self.assertEqual(invocations, 2, "one 416, then one fresh replay")
+        args = (Path(self.cache) / "_args").read_text(encoding="utf-8")
+        self.assertIn("--no-continue", args)
+        self.assertIn("--load-info-json", args,
+                      "still the replay, not a full extraction")
+
+    def test_the_replay_command_carries_the_attempts_extra(self):
+        cmd = downloader._info_command("yt-dlp", Path("x.info.json"), "best",
+                                       Path(self.cache), Path("p.txt"),
+                                       ["--no-continue"])
+        self.assertIn("--no-continue", cmd)
+        self.assertLess(cmd.index("--no-continue"), cmd.index("--load-info-json"))
+
+
+class YtdlpMovedFolderMessageTests(unittest.TestCase):
+    def test_the_message_names_the_file_it_found(self):
+        source = (ROOT / "chuutubepoi" / "bootstrap.py").read_text(
+            encoding="utf-8")
+        self.assertNotIn('"[chuutube] yt-dlp.exe would not start', source)
+        self.assertIn("{Path(exe).name} would not start", source)
 
 
 class CacheKeyTests(unittest.TestCase):
@@ -9752,7 +12562,7 @@ class DeveloperSettingsIsolationTests(unittest.TestCase):
     """
 
     def test_no_settings_file_is_read_by_the_tests(self):
-        self.assertEqual(os.environ.get("CHUUTUBE2SPOUT_SETTINGS_FILE"), "none")
+        self.assertEqual(os.environ.get("CHUUTUBEPOI_SETTINGS_FILE"), "none")
         self.assertIsNone(config._settings_path())
         self.assertIsNone(config.SETTINGS_FILE)
 
@@ -9774,8 +12584,8 @@ class DeveloperSettingsIsolationTests(unittest.TestCase):
             path = Path(tmp) / "other.txt"
             path.write_text("LOOP=0\n", encoding="utf-8")
             with mock.patch.dict(os.environ,
-                                 {"CHUUTUBE2SPOUT_SETTINGS_FILE": str(path)}):
+                                 {"CHUUTUBEPOI_SETTINGS_FILE": str(path)}):
                 self.assertEqual(config._settings_path(), path)
             with mock.patch.dict(os.environ,
-                                 {"CHUUTUBE2SPOUT_SETTINGS_FILE": str(path) + "x"}):
+                                 {"CHUUTUBEPOI_SETTINGS_FILE": str(path) + "x"}):
                 self.assertIsNone(config._settings_path())

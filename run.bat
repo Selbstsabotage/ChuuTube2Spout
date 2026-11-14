@@ -1,5 +1,5 @@
 @echo off
-rem Launch ChuuTube2Spout using the virtual environment created by setup.ps1.
+rem Launch ChuuTubePoi using the virtual environment created by setup.ps1.
 rem
 rem Settings live in settings.txt next to this file - not here. That way
 rem doctor.bat and check.bat see them too, and updates cannot overwrite them.

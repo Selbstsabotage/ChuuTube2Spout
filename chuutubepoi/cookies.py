@@ -41,6 +41,7 @@ from __future__ import annotations
 import atexit
 import os
 import shutil
+import sys
 import sqlite3
 import tempfile
 import time
@@ -231,7 +232,7 @@ def export(value: str, dest: Path, domains=DEFAULT_DOMAINS) -> tuple[Path | None
     # The profile *name* only. The full path contains the Windows account name,
     # and this header travels inside any copy of the file.
     lines = ["# Netscape HTTP Cookie File",
-             f"# Written by ChuuTube2Spout from the {profile.name} profile", ""]
+             f"# Written by ChuuTubePoi from the {profile.name} profile", ""]
     picked: list[tuple[str, int, str]] = []      # name, header cost, file line
     for host, path, secure, expiry, name, cookie_value in rows:
         low = str(host or "").lower().lstrip(".")
@@ -363,3 +364,139 @@ def ensure(value: str, cache_dir=None, max_age_minutes: float = 60.0,
         # long way, and a locked profile now should not end a set.
         return dest, warning
     return exported, warning
+
+
+# --- is the login there? (1.0.5) -------------------------------------------
+# K, after the first Mac run: "it's virtually impossible to use it without
+# cookies" - so say at start, once, when they are missing or no good, instead
+# of letting the first clip find out with a 403 or a bot check.
+#
+# Checked offline, from the cookies themselves: is there a YouTube login, and
+# has it expired? Whether YouTube still honours it can only be known by asking
+# YouTube, and a start-up check should not cost a request against the rate
+# limit.
+
+# Present only while a Google account is signed in on youtube.com. One live
+# one is enough: they are set and cleared together.
+LOGIN_COOKIES = frozenset({
+    "LOGIN_INFO", "SID", "SAPISID", "__Secure-1PSID", "__Secure-3PSID",
+    "__Secure-3PAPISID",
+})
+
+YOUTUBE_DOMAIN = "youtube.com"
+
+
+def _expiry_seconds(raw) -> float:
+    """A cookie's expiry in Unix seconds; 0 for a session cookie.
+
+    Newer Firefox versions store milliseconds where older ones stored seconds.
+    No real expiry in seconds is past 1e11 (the year 5138), so anything larger
+    is milliseconds.
+    """
+    try:
+        value = float(raw or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return value / 1000.0 if value > 1e11 else value
+
+
+def login_state(cookies, now: float) -> tuple[bool, str]:
+    """(signed in, why not) from (host, name, expiry) triples."""
+    youtube = []
+    for host, name, expiry in cookies:
+        low = str(host or "").lower().lstrip(".")
+        if low == YOUTUBE_DOMAIN or low.endswith("." + YOUTUBE_DOMAIN):
+            youtube.append((str(name or ""), _expiry_seconds(expiry)))
+    if not youtube:
+        return False, "it has no YouTube cookies at all"
+    logins = [(n, e) for n, e in youtube if n in LOGIN_COOKIES]
+    if not logins:
+        return False, "it is not signed in to YouTube"
+    if not any(e == 0 or e > now for _, e in logins):
+        return False, "its YouTube login has expired"
+    return True, ""
+
+
+def _firefox_rows(profile: Path) -> list[tuple]:
+    workdir = Path(tempfile.mkdtemp(prefix="chuutube-cookiecheck-"))
+    try:
+        copy = _copy_store(profile, workdir)
+        connection = sqlite3.connect(str(copy))
+        try:
+            return connection.execute(
+                "SELECT host, name, expiry FROM moz_cookies").fetchall()
+        finally:
+            connection.close()
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _ytdlp_rows(value: str) -> list[tuple]:
+    """Any other browser, read by yt-dlp the way a download will read it.
+
+    BROWSER[+KEYRING][:PROFILE][::CONTAINER], as yt-dlp's
+    --cookies-from-browser takes it. On a Mac, Chrome asks for the keychain
+    here exactly as it does on the first download.
+    """
+    from yt_dlp.cookies import extract_cookies_from_browser
+    spec, _, container = value.partition("::")
+    browser, _, profile = spec.partition(":")
+    browser, _, keyring = browser.partition("+")
+    jar = extract_cookies_from_browser(
+        browser.lower(), profile or None, keyring=(keyring.upper() or None),
+        container=(container or None))
+    return [(c.domain, c.name, c.expires or 0) for c in jar]
+
+
+def refused_by_macos(exc: BaseException, platform: str | None = None) -> bool:
+    """macOS's privacy protection, not a missing browser or a bad setting.
+
+    macOS 27 protects some browsers' data folders from other apps (tester,
+    1.1: "[Errno 1] Operation not permitted: .../Firefox/Profiles" in the
+    app, while the same setting worked when started from Terminal - Terminal
+    had the permission). It is errno 1 (EPERM), not 13 (EACCES).
+    """
+    if (platform or sys.platform) != "darwin":
+        return False
+    return getattr(exc, "errno", None) == 1 or "Operation not permitted" in str(exc)
+
+
+# How the message below starts: the window looks for it to add its button.
+MAC_PRIVACY_START = "macOS did not let the app read the login of"
+
+
+def mac_privacy_help(browser: str) -> str:
+    """What to do. An app cannot put itself on the Full Disk Access list -
+    macOS leaves that to the user, and does not list it on its own either
+    (tester, 1.1: it had to be added with +)."""
+    return (f"{MAC_PRIVACY_START} {browser}. Allow it in System Settings > "
+            "Privacy & Security > Full Disk Access: select +, choose "
+            "ChuuTubePoi, and make sure its switch is on. Then start the app "
+            "again. A newly built copy of the app may need this again.")
+
+
+def check(value: str, now: float | None = None) -> tuple[bool, str]:
+    """Will downloads go out signed in to YouTube? (ok, what is wrong).
+
+    Never raises: anything unexpected is itself the answer.
+    """
+    value = (value or "").strip()
+    if not value:
+        return False, ("No browser is set to take the YouTube login from "
+                       "(COOKIES_FROM_BROWSER in settings.txt). Without it "
+                       "YouTube refuses or limits most clips.")
+    browser = value.split(":", 1)[0].split("+", 1)[0]
+    try:
+        profile = profile_path(value)
+        rows = _firefox_rows(profile) if profile is not None else _ytdlp_rows(value)
+    except Exception as exc:
+        if refused_by_macos(exc):
+            return False, mac_privacy_help(browser)
+        return False, (f"Could not read the cookies of {browser}: {exc}. "
+                       "Is the browser installed, and the setting right?")
+    ok, why = login_state(rows, time.time() if now is None else now)
+    if ok:
+        return True, ""
+    return False, (f"The browser set for cookies ({browser}): {why}. Sign in "
+                   f"to youtube.com in {browser}, then restart ChuuTubePoi. "
+                   "Without a login YouTube refuses or limits most clips.")

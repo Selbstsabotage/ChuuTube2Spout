@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Minimal stand-ins for PySide6, OpenGL and mpv.
 
-They exist so the logic in chuutube2spout can be exercised on a machine without a GPU,
+They exist so the logic in chuutubepoi can be exercised on a machine without a GPU,
 a display, or Windows - which catches import errors, typos and wiring mistakes
 long before anything touches real hardware. They are NOT a simulation of Qt.
 """
@@ -364,6 +364,34 @@ def install() -> None:
     for name in ("QKeySequence", "QShortcut", "QSurfaceFormat", "QOpenGLContext",
                  "QOffscreenSurface", "QIcon", "QAction", "QPainter", "QColor"):
         setattr(qtgui, name, type(name, (Stub,), {}))
+
+    class QDesktopServices(Stub):
+        """Records what the app asked the system to open."""
+        opened: list = []
+
+        @staticmethod
+        def openUrl(url):
+            QDesktopServices.opened.append(url)
+            return True
+    qtgui.QDesktopServices = QDesktopServices
+
+    class QUrl(Stub):
+        def __init__(self, text=""):
+            self.text = text
+
+        @staticmethod
+        def fromLocalFile(path):
+            return QUrl("file://" + str(path))
+
+        def toLocalFile(self):
+            return self.text[len("file://"):]
+
+        def __eq__(self, other):
+            return isinstance(other, QUrl) and other.text == self.text
+
+        def __hash__(self):
+            return hash(self.text)
+    qtcore.QUrl = QUrl
 
     qtwidgets = types.ModuleType("PySide6.QtWidgets")
     for name in ("QMainWindow", "QWidget", "QFrame", "QLabel", "QLineEdit",

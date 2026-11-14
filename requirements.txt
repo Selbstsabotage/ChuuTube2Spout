@@ -27,3 +27,15 @@ bgutil-ytdlp-pot-provider==2.0.0
 
 # Spout2 GPU texture sharing (Windows only)
 SpoutGL>=0.0.4 ; sys_platform == "win32"
+
+# Syphon GPU texture sharing (macOS only, since 1.1). The [opengl] extra pulls
+# in what its OpenGL server needs. Supports Python 3.10 to 3.14.
+syphon-python[opengl]>=0.2.0,<0.3 ; sys_platform == "darwin"
+# The Metal path (syphon_out._MetalPath, 1.0.8): Metal textures and the
+# IOSurface they share with OpenGL.
+pyobjc-framework-Metal>=10 ; sys_platform == "darwin"
+pyobjc-framework-IOSurface>=10 ; sys_platform == "darwin"
+
+# macOS: NSProcessInfo, to keep App Nap from slowing the render timer while
+# Resolume is in front (macos.py).
+pyobjc-framework-Cocoa>=10 ; sys_platform == "darwin"

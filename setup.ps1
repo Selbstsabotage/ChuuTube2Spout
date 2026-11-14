@@ -1,5 +1,5 @@
 <#
-    ChuuTube2Spout setup (Windows)
+    ChuuTubePoi setup (Windows)
 
     Creates a virtual environment, installs the Python dependencies, and fetches
     libmpv - the one piece that cannot come from pip.
@@ -18,7 +18,7 @@ param(
     # Only fills in entries that are missing; it never overwrites one.
     [switch]$Pin,
 
-    # Fetch only the native runtime - libmpv, deno, the token generator - and
+    # Fetch only the native runtime - libmpv, Node.js, the token generator - and
     # skip Python entirely. This is what a downloaded RELEASE runs: the exe has
     # its own Python inside, but the third-party binaries are deliberately not
     # bundled, because redistributing them would make the person publishing the
@@ -81,8 +81,11 @@ $PINNED = @{
     # happens then. Bump it as part of every release.
     Mpv      = @{ Tag = "20261021"
                   Name = "mpv-dev-x86_64-20261021-git-e471496c56.7z" }
-    Deno     = @{ Tag = "v2.9.7"
-                  Name = "deno-x86_64-pc-windows-msvc.zip" }
+    # Node.js runs yt-dlp's challenge solver and the token generator. It
+    # replaced deno in 1.1. The LTS line, from nodejs.org itself: Node
+    # publishes its releases there, not on GitHub.
+    Node     = @{ Version = "26.13.0"
+                  Name = "node-v26.13.0-win-x64.zip" }
     # From ip7z/7zip rather than 7-zip.org/a/7zr.exe: that URL is unversioned
     # and the site publishes no checksums at all, so a pin against it could
     # only ever mean "whatever was served the day I ran -Pin".
@@ -95,7 +98,8 @@ $PINNED = @{
 function Assert-TrustedUrl([string]$Url) {
     # The download URLs are read out of GitHub API responses, not hardcoded, and
     # Invoke-WebRequest follows redirects silently. Assert where we ended up.
-    if ($Url -notmatch '^https://([a-z0-9-]+\.)*(github\.com|githubusercontent\.com|7-zip\.org)/') {
+    # nodejs.org since 1.1: Node.js is published there and nowhere else.
+    if ($Url -notmatch '^https://([a-z0-9-]+\.)*(github\.com|githubusercontent\.com|7-zip\.org|nodejs\.org)/') {
         throw "refusing to download from an unexpected host: $Url"
     }
 }
@@ -396,6 +400,36 @@ if ($Licenses) {
     $sitePkgs = Join-Path $Root ".venv\Lib\site-packages"
     if (-not (Test-Path $sitePkgs)) { Die "no .venv yet - run setup.ps1 first" }
 
+    # Packages whose wheels carry no licence text, or not the right one: the
+    # text comes from the project and is saved as licenses\<package>.txt, under
+    # the exact name pip uses. The PySide6 wheels for Windows carry only the Qt
+    # commercial notice; the app uses Qt under LGPL-3.0, so that text is
+    # fetched too (1.1). setup.sh has the same list for the Mac.
+    $qtLgpl = "https://raw.githubusercontent.com/qtproject/pyside-pyside-setup/dev/LICENSES/LGPL-3.0-only.txt"
+    $packageTexts = [ordered]@{
+        "bgutil-ytdlp-pot-provider" = "https://raw.githubusercontent.com/Brainicism/bgutil-ytdlp-pot-provider/master/LICENSE"
+        "PyOpenGL"           = "https://raw.githubusercontent.com/mcfletch/pyopengl/master/license.txt"
+        "PySide6"            = $qtLgpl
+        "PySide6_Addons"     = $qtLgpl
+        "PySide6_Essentials" = $qtLgpl
+        "PySide6_Pdf"        = $qtLgpl
+        "PySide6_WebEngine"  = $qtLgpl
+        "shiboken6"          = $qtLgpl
+    }
+    foreach ($pkg in $packageTexts.Keys) {
+        $out = Join-Path $licDir "$pkg.txt"
+        if (Test-Path $out) { continue }
+        try {
+            Assert-TrustedUrl $packageTexts[$pkg]
+            Invoke-WebRequest -Uri $packageTexts[$pkg] -OutFile $out -UseBasicParsing
+            Say "  fetched the licence of $pkg"
+        } catch {
+            Remove-Item $out -ErrorAction SilentlyContinue
+            Warn "  could not fetch the licence of ${pkg}: $_"
+            Warn "    get it from $($packageTexts[$pkg])"
+        }
+    }
+
     Say "Reading licences out of the installed packages"
     $rows = @()
     $missing = @()
@@ -411,32 +445,30 @@ if ($Licenses) {
         $declared = if ($info.Expression) { $info.Expression }
                     elseif ($info.Classifiers.Count) { $info.Classifiers -join "; " }
                     else { "NOT DECLARED" }
+        $files = @()
+        $candidates = @("$($info.Name).txt")
         if ($info.Text) {
-            $file = "$($info.Name)-$($info.Version).txt"
-            Set-Content -Path (Join-Path $licDir $file) -Value $info.Text `
+            $files += "$($info.Name)-$($info.Version).txt"
+            Set-Content -Path (Join-Path $licDir $files[0]) -Value $info.Text `
                         -Encoding UTF8
         } else {
-            # The wheel carried no text - but somebody may already have fetched
-            # it by hand, which is exactly what the checklist in
-            # THIRD-PARTY-NOTICES.md tells them to do. Look before declaring it
-            # missing, or this file permanently contradicts the folder it is
-            # describing, and the one step of the publish checklist that CAN be
-            # finished can never be marked done.
-            $file = ""
-            foreach ($candidate in @("$($info.Name)-$($info.Version).txt",
-                                     "$($info.Name).txt")) {
-                if (Test-Path (Join-Path $licDir $candidate)) {
-                    $file = $candidate
-                    $byHand += $candidate
-                    break
-                }
-            }
-            if (-not $file) { $missing += "$($info.Name) $($info.Version)" }
+            $candidates += "$($info.Name)-$($info.Version).txt"
         }
+        # A text from the project itself (fetched above, or by hand). Listed
+        # even when the wheel has one, as for PySide6. Without this look the
+        # inventory permanently contradicts the folder it describes, and the
+        # publish step that asks for the missing texts can never be finished.
+        foreach ($candidate in $candidates) {
+            if (Test-Path (Join-Path $licDir $candidate)) {
+                $files += $candidate
+                $byHand += $candidate
+                break
+            }
+        }
+        if (-not $files.Count) { $missing += "$($info.Name) $($info.Version)" }
         $rows += [pscustomobject]@{
             Name = $info.Name; Version = $info.Version
-            Declared = $declared; File = $file
-            ByHand = ($file -and $byHand -contains $file)
+            Declared = $declared; Files = $files
         }
     }
 
@@ -448,8 +480,8 @@ if ($Licenses) {
            Url = "https://raw.githubusercontent.com/mpv-player/mpv/master/Copyright" }
         @{ Name = "Spout2"; Why = "texture sharing, inside SpoutGL"
            Url = "https://raw.githubusercontent.com/leadedge/Spout2/master/LICENSE" }
-        @{ Name = "deno"; Why = "runs the token generator"
-           Url = "https://raw.githubusercontent.com/denoland/deno/main/LICENSE.md" }
+        @{ Name = "Node.js"; Why = "runs the token generator and yt-dlp's challenge solver"
+           Url = "https://raw.githubusercontent.com/nodejs/node/main/LICENSE" }
         @{ Name = "bgutil-pot (Rust port)"; Why = "standalone token server"
            Url = "https://raw.githubusercontent.com/jim60105/bgutil-ytdlp-pot-provider-rs/master/LICENSE" }
     )
@@ -478,9 +510,12 @@ if ($Licenses) {
         "|---|---|---|---|"
     )
     foreach ($r in $rows) {
-        $f = if (-not $r.File) { "**none shipped**" }
-             elseif ($r.ByHand) { "``$($r.File)`` (fetched by hand)" }
-             else { "``$($r.File)``" }
+        $f = if (-not $r.Files.Count) { "**none shipped**" }
+             else {
+                 ($r.Files | ForEach-Object {
+                     if ($byHand -contains $_) { "``$_`` (from the project)" }
+                     else { "``$_``" } }) -join ", "
+             }
         $lines += "| $($r.Name) | $($r.Version) | $($r.Declared) | $f |"
     }
     $lines += @("", "## Not from pip", "",
@@ -491,10 +526,10 @@ if ($Licenses) {
     if ($missing.Count) {
         $lines += @("", "## Shipped no licence text", "",
                     "These declare a licence, carry no text in their wheel, and have",
-                    "no text in ``licenses\`` either - so one has to be fetched from",
-                    "the project before publishing a binary. A row above marked",
-                    "``(fetched by hand)`` has already been dealt with and is not",
-                    "listed here.",
+                    "no text in ``licenses\`` either. Add each to the list of package",
+                    "texts in setup.ps1 with the URL of its licence text, then run",
+                    "``setup.ps1 -Licenses`` again. A row above marked",
+                    "``(from the project)`` has already been dealt with.",
                     "")
         foreach ($m in $missing) { $lines += "- $m" }
     }
@@ -502,7 +537,7 @@ if ($Licenses) {
 
     Say "licenses\ now holds $($rows.Count) package licence(s) + INVENTORY.md"
     if ($byHand.Count) {
-        Say "$($byHand.Count) text(s) came from licenses\ rather than a wheel - kept"
+        Say "$($byHand.Count) text(s) came from the projects, not the wheels - listed"
     }
     if ($missing.Count) {
         Warn "$($missing.Count) package(s) shipped no licence text - see INVENTORY.md"
@@ -564,7 +599,7 @@ if (Test-Path $dllTarget) {
         $extracted = $false
         $refused = $false
         # A refusal from either extractor's check lands here, so it reads as
-        # a refusal rather than "7zr download failed" - and deno and the token
+        # a refusal rather than "7zr download failed" - and Node.js and the token
         # generator below still get their turn.
         try {
             # Windows 10+ ships bsdtar, which can usually read 7z. Listed
@@ -629,42 +664,59 @@ if (Test-Path $dllTarget) {
     }
 }
 
-# ------------------------------------------------------------------ deno -----
+# ------------------------------------------------------------------ node -----
 # yt-dlp needs a JavaScript runtime to solve YouTube's signature challenges.
 # Without one it silently falls back to player clients that now require a PO
-# token, and every media fetch comes back 403. deno.exe is a single portable
-# binary, so we drop it in this folder rather than installing anything.
-$denoTarget = Join-Path $Root "deno.exe"
-if (Test-Path $denoTarget) {
-    Say "deno.exe already present - skipping download"
-} elseif ((Get-Command deno -ErrorAction SilentlyContinue) -and -not $Portable) {
-    Say "deno is already on your PATH - skipping download"
-    Say "  (run 'setup.ps1 -Portable' to keep a local copy instead)"
+# token, and every media fetch comes back 403. The token generator runs on the
+# same runtime.
+#
+# Node.js since 1.1 (deno before). The whole release goes into the folder
+# "node" - node.exe and npm - and nothing is installed system-wide. A Node on
+# PATH is not used: its version is whatever that machine has, and the token
+# plugin ignores anything older than 22 without saying so.
+$nodeDir = Join-Path $Root "node"
+$nodeExe = Join-Path $nodeDir "node.exe"
+$npmCli  = Join-Path $nodeDir "node_modules\npm\bin\npm-cli.js"
+$nodePin = $PINNED.Node
+$nodeHave = ""
+if (Test-Path $nodeExe) {
+    try { $nodeHave = (& $nodeExe --version 2>$null | Out-String).Trim() } catch { }
+}
+if ($nodeHave -eq "v$($nodePin.Version)" -and (Test-Path $npmCli)) {
+    Say "Node.js $nodeHave already present - skipping download"
 } else {
-    $denoPin = $PINNED.Deno
-    Say "Fetching deno $($denoPin.Tag) (JavaScript runtime for yt-dlp)"
+    if ($nodeHave) { Say "Replacing Node.js $nodeHave with v$($nodePin.Version)" }
+    Say "Fetching Node.js v$($nodePin.Version) (JavaScript runtime)"
     try {
-        $denoTmp = New-ScratchDir "deno"
-        $denoZip = Join-Path $denoTmp "deno.zip"
-        Get-Verified "https://github.com/denoland/deno/releases/download/$($denoPin.Tag)/$($denoPin.Name)" `
-                     $denoZip $denoPin.Name
-        Assert-SafeEntries (Get-ZipEntryNames $denoZip) $denoZip
-        Expand-Archive -Path $denoZip -DestinationPath $denoTmp -Force
-        Assert-NoLinks $denoTmp
-        $denoExe = Get-ChildItem -Path $denoTmp -Recurse -Filter "deno.exe" | Select-Object -First 1
-        if ($denoExe) {
-            Copy-Item $denoExe.FullName $denoTarget -Force
-            Say "Installed deno.exe ($($denoPin.Tag))"
+        $nodeTmp = New-ScratchDir "node"
+        $nodeZip = Join-Path $nodeTmp $nodePin.Name
+        Get-Verified "https://nodejs.org/dist/v$($nodePin.Version)/$($nodePin.Name)" `
+                     $nodeZip $nodePin.Name
+        Assert-SafeEntries (Get-ZipEntryNames $nodeZip) $nodeZip
+        $nodeOut = Join-Path $nodeTmp "x"
+        Expand-Archive -Path $nodeZip -DestinationPath $nodeOut -Force
+        Assert-NoLinks $nodeOut
+        # The zip holds one folder, node-v<version>-win-x64, with node.exe and
+        # npm inside. Copied, not moved: %TEMP% and this folder are often on
+        # different drives, and Move-Item cannot move a folder across drives.
+        $inner = Get-ChildItem -Path $nodeOut -Directory | Select-Object -First 1
+        if ($inner -and (Test-Path (Join-Path $inner.FullName "node.exe"))) {
+            if (Test-Path $nodeDir) { Remove-Item -Recurse -Force $nodeDir }
+            Copy-Item -Recurse $inner.FullName $nodeDir
+            Say "Installed Node.js v$($nodePin.Version) in the folder 'node'"
         } else {
-            Warn "deno.zip downloaded but contained no deno.exe"
+            Warn "$($nodePin.Name) downloaded but held no node.exe"
         }
-        Remove-Item -Recurse -Force $denoTmp -ErrorAction SilentlyContinue
+        Remove-Item -Recurse -Force $nodeTmp -ErrorAction SilentlyContinue
     } catch {
-        Warn "Could not install deno automatically: $_"
-        Warn "Download $($denoPin.Name) from"
-        Warn "  https://github.com/denoland/deno/releases/tag/$($denoPin.Tag)"
-        Warn "and put deno.exe next to this script."
+        Warn "Could not install Node.js automatically: $_"
+        Warn "Download $($nodePin.Name) from"
+        Warn "  https://nodejs.org/dist/v$($nodePin.Version)/"
+        Warn "and unzip it here, so that node\node.exe exists."
     }
+}
+if (Test-Path (Join-Path $Root "deno.exe")) {
+    Say "deno.exe is no longer used (Node.js replaced it in 1.1) - you can delete it"
 }
 
 # ------------------------------------------------- PO token provider ---------
@@ -701,8 +753,8 @@ $potTarget = Join-Path $Root "bgutil-pot.exe"
 $potPin = $PINNED.PotExe
 
 # The standalone Rust generator is a SPARE. What actually serves tokens is the
-# deno script from the same release as the plugin (below); this only comes into
-# play when deno is unavailable.
+# generator from the same release as the plugin (below), run by Node.js; this
+# only comes into play when that cannot run.
 #
 # It is also a separate project on its own version line - it stopped tracking
 # upstream at 0.8.1 - and the plugin refuses to talk across a major-version gap.
@@ -719,7 +771,7 @@ if (Test-Path $potTarget) {
     Say "Skipping the standalone generator - nothing is wrong"
     Say "  It is on $($potPin.Version), the plugin is on $pluginVer, and the plugin"
     Say "  refuses across a major-version gap, so it could not answer anyway."
-    Say "  Tokens come from deno script mode instead. Raise PotExe in the pin"
+    Say "  Tokens come from the Node.js generator instead. Raise PotExe in the pin"
     Say "  table once a build that matches the plugin exists."
 } else {
     Say "Fetching the PO token generator $($potPin.Tag)"
@@ -748,15 +800,15 @@ if (Test-Path $potTarget) {
         Warn "Download '$($potPin.Name)' from"
         Warn "  https://github.com/jim60105/bgutil-ytdlp-pot-provider-rs/releases/tag/$($potPin.Tag)"
         Warn "and save it next to this script as 'bgutil-pot.exe'."
-        Warn "It is only a spare - deno script mode is the primary, so this bites"
-        Warn "only if deno is unavailable too."
+        Warn "It is only a spare - the Node.js generator is the primary, so this"
+        Warn "bites only if that cannot run either."
     }
 }
 
 # ------------------------------------- token generator, script mode ----------
 # The plugin ships its own generator source. Fetching the copy that matches the
-# installed plugin version removes the whole class of protocol mismatch, and
-# deno runs the TypeScript directly - no Node.js needed.
+# installed plugin version removes the whole class of protocol mismatch. Node.js
+# cannot run the TypeScript as it is, so it is built below.
 # $pluginVer was read above, next to the standalone-generator check.
 if ($pluginVer) { $pluginVer = $pluginVer.Trim() }
 $scriptRoot = Join-Path $Root "bgutil-server"
@@ -799,55 +851,69 @@ if ($pluginVer -and -not (Get-Generator $scriptSrc)) {
     Say "Token generator source for $pluginVer already present"
 }
 
-# deno fetches the npm packages on demand but will not materialise node_modules
-# by itself - without this step every token request dies with
-# "Could not resolve \"commander\" ... Did you forget to run `deno install`?"
-$serverDir = Join-Path $scriptRoot "bgutil-ytdlp-pot-provider-$pluginVer\server"
-if ((Get-Generator (Join-Path $serverDir "src")) -and -not (Test-Path (Join-Path $serverDir "node_modules"))) {
-    Say "Installing the generator's dependencies with deno (one-time, a few minutes)"
-    $denoCmd = if (Test-Path (Join-Path $Root "deno.exe")) { Join-Path $Root "deno.exe" } else { "deno" }
-    $prevEAP2 = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    Push-Location $serverDir
-    # No --allow-scripts. That authorises npm lifecycle/postinstall scripts for
-    # every package in the resolved tree - and there is no lockfile, so the tree
-    # is re-resolved on each machine. One compromised transitive dependency would
-    # then run as the user, at setup time, on every install. The packages that
-    # want scripts here are dev-only; the token generator works without them.
-    $denoOut = (& $denoCmd install 2>&1 | Out-String)
-    $denoExit = $LASTEXITCODE
-    # What deno says when the drive cannot make the NTFS junctions node_modules
-    # is built from: "failed to create junction ... Incorrect function. (os
-    # error 1)". exFAT and FAT32 have no reparse points, and some network and
-    # sync drives refuse them too - so this is keyed on the refusal, not on the
-    # filesystem's name. Retrying on the same drive only spends another minute
-    # failing the same way.
-    $linkFailure = $denoOut -match "junction|symlink|reparse|Incorrect function"
-    if ($denoExit -ne 0 -and -not $linkFailure) {
-        # A second attempt, in case the first was a transient registry error.
-        # Deliberately NOT a retry with --allow-scripts: if the tree genuinely
-        # cannot install without running postinstall scripts, that is a decision
-        # for a human, not a silent fallback.
-        $denoOut = (& $denoCmd install 2>&1 | Out-String)
-        $denoExit = $LASTEXITCODE
-        $linkFailure = $denoOut -match "junction|symlink|reparse|Incorrect function"
-    }
-    Pop-Location
-    $ErrorActionPreference = $prevEAP2
-    # The exit code, not the folder. A deno install that dies half way has
-    # already created node_modules - which is how this reported "installed" on
-    # a tester's drive where nothing could resolve.
-    if ($denoExit -eq 0) {
-        Say "Generator dependencies installed"
-    } elseif ($linkFailure) {
-        Warn "This drive refused to create the junctions deno builds the token"
-        Warn "generator's dependencies from (`"Incorrect function`") - exFAT and"
-        Warn "FAT32 drives cannot make them. Nothing to fix here: the app builds"
-        Warn "them under %LOCALAPPDATA%\ChuuTube2Spout on its first launch"
-        Warn "instead, which takes about a minute."
+# Node.js runs the generator compiled, from build\ - the plugin looks for
+# build\generate_once.js, the app starts build\main.js as the server. Two
+# steps, as in the generator's own Dockerfile: npm ci, then tsc.
+#
+# npm ci, not npm install: it installs exactly what package-lock.json lists,
+# each package checked against the integrity hash recorded there, and refuses
+# if the lock and package.json disagree. --ignore-scripts: no package's install
+# script runs - one compromised dependency would otherwise run as the user,
+# here, on every install. The same choice as before with deno (no
+# --allow-scripts). The two packages that ask for scripts are canvas and
+# @swc/core; the generator ran without either script under deno.
+#
+# The app repeats both steps by itself if the build is missing (potprovider.py,
+# install_script_deps), so a failure here is not the end of it.
+$serverDir   = Join-Path $scriptRoot "bgutil-ytdlp-pot-provider-$pluginVer\server"
+$builtServer = Join-Path $serverDir "build\main.js"
+$builtScript = Join-Path $serverDir "build\generate_once.js"
+function Test-GeneratorBuilt {
+    return (Test-Path $builtServer) -and (Test-Path $builtScript) -and `
+           (Test-Path (Join-Path $serverDir "node_modules"))
+}
+if ((Get-Generator (Join-Path $serverDir "src")) -and -not (Test-GeneratorBuilt)) {
+    if (-not (Test-Path $nodeExe) -or -not (Test-Path $npmCli)) {
+        Warn "Node.js is not installed (see above), so the token generator cannot"
+        Warn "be built. Run this script again once the download works."
     } else {
-        Warn "deno install failed:"
-        Warn ($denoOut -split "`n" | Select-Object -Last 5)
+        Say "Building the token generator with Node.js (one-time, a few minutes)"
+        $env:npm_config_update_notifier = "false"
+        $env:npm_config_fund = "false"
+        $env:npm_config_audit = "false"
+        $env:npm_config_color = "false"
+        $prevEAP2 = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        Push-Location $serverDir
+        $npmOut = (& $nodeExe $npmCli ci --ignore-scripts --no-audit --no-fund 2>&1 | Out-String)
+        $npmExit = $LASTEXITCODE
+        if ($npmExit -ne 0) {
+            # A second attempt, in case the first was a transient registry
+            # error. Deliberately NOT a retry with scripts allowed: if the tree
+            # genuinely cannot install without them, that is a decision for a
+            # human, not a silent fallback.
+            $npmOut = (& $nodeExe $npmCli ci --ignore-scripts --no-audit --no-fund 2>&1 | Out-String)
+            $npmExit = $LASTEXITCODE
+        }
+        $tscOut = ""
+        if ($npmExit -eq 0) {
+            $tsc = Join-Path $serverDir "node_modules\typescript\bin\tsc"
+            $tscOut = (& $nodeExe $tsc 2>&1 | Out-String)
+        }
+        Pop-Location
+        $ErrorActionPreference = $prevEAP2
+        # The built files, not tsc's exit code: tsc writes its output even when
+        # it also reports a type error. And not node_modules alone: an install
+        # that dies half way has already created it.
+        if (Test-GeneratorBuilt) {
+            Say "Token generator built"
+        } elseif ($npmExit -ne 0) {
+            Warn "npm ci failed:"
+            Warn ($npmOut -split "`n" | Select-Object -Last 5)
+        } else {
+            Warn "Building the token generator (tsc) failed:"
+            Warn ($tscOut -split "`n" | Select-Object -Last 5)
+        }
     }
 }
 
@@ -857,7 +923,7 @@ if ((Get-Generator (Join-Path $serverDir "src")) -and -not (Test-Path (Join-Path
 # which silently removes the provider altogether. Keep the plugin current and
 # report a mismatch instead.
 $scriptModeReady = ($null -ne (Get-Generator (Join-Path $serverDir "src"))) -and `
-                   (Test-Path (Join-Path $serverDir "node_modules"))
+                   (Test-GeneratorBuilt)
 if ($scriptModeReady) {
     # Script mode is what actually issues tokens when it is present: the plugin
     # and the generator come from the same release. The standalone .exe is then
@@ -876,7 +942,7 @@ if ($scriptModeReady) {
         if ($a -ne $b) {
             Warn "Token plugin $($pluginVersion.Trim()) and generator $potVersion are on different major versions."
             Warn "The plugin will decline to use it, so no PO token is issued."
-            Warn "ChuuTube2Spout will skip the generator rather than spam warnings."
+            Warn "ChuuTubePoi will skip the generator rather than spam warnings."
         } else {
             Say "Token plugin $($pluginVersion.Trim()) matches generator $potVersion"
         }
@@ -904,7 +970,7 @@ if (-not (Test-Path $settings)) {
 # Everything above warns and carries on, so that one failed download does not
 # cost the others. Which means the script has to say at the end whether what
 # it left behind can actually start. mpv-2.dll is the one piece the app cannot
-# open without; deno and the token generator missing cost quality, not the
+# open without; Node.js and the token generator missing cost quality, not the
 # window, and the app reports them itself.
 #
 # Until 0.9.9.18 this printed "Runtime installed" either way. The first-run
@@ -919,8 +985,8 @@ if (-not (Test-Path $dllTarget)) {
 # -------------------------------------------------------------- diagnose -----
 if ($RuntimeOnly) {
     Write-Host ""
-    Say "Runtime installed. Start the app with ChuuTube2Spout.exe"
-    Say "If anything looks wrong, run:  ChuuTube2Spout.exe --doctor"
+    Say "Runtime installed. Start the app with ChuuTubePoi.exe"
+    Say "If anything looks wrong, run:  ChuuTubePoi.exe --doctor"
 } else {
     Say "Running diagnostics"
     & $VenvPy (Join-Path $Root "run.py") --doctor

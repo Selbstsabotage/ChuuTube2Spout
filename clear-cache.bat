@@ -3,7 +3,7 @@ rem Delete downloaded clips and the record of what was fetched.
 rem Safe at any time - anything you load again is simply fetched again.
 rem
 rem Deliberately goes through run.py rather than "rmdir cache": the cache
-rem location is configurable (CHUUTUBE2SPOUT_CACHE / settings.txt), and a script that
+rem location is configurable (CHUUTUBEPOI_CACHE / settings.txt), and a script that
 rem hardcodes "cache" would say "Done." while leaving a relocated cache - and
 rem the viewing history in it - exactly where it was.
 setlocal

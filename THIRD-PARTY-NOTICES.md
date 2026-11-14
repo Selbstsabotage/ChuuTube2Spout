@@ -1,12 +1,12 @@
 # Third-party notices
 
-This document lists the third-party components in a ChuuTube2Spout **release
+This document lists the third-party components in a ChuuTubePoi **release
 zip** and their licences. The source repository contains no third-party code:
 setup downloads or pip-installs it on your own computer.
 
 ## Not in the zip, on purpose
 
-**libmpv, deno and the PO token generator are not included.** The first-run
+**libmpv, Node.js and the PO token generator are not included.** The first-run
 setup downloads each one from the project that publishes it, at a pinned
 version, and checks it against `checksums.txt`.
 
@@ -15,6 +15,8 @@ These have the strictest terms of everything involved:
 - The Windows builds of libmpv are GPL, because of the codec libraries
   compiled into them, and their distributor states no licence of its own.
 - The token generator is GPL-3.0.
+- Node.js (since 1.1, in place of deno) is MIT-licensed, and bundles other
+  projects' code under their own licences.
 
 Shipping them would make whoever publishes the zip responsible for all of
 that. Downloading them on each computer leaves that with the projects
@@ -31,15 +33,18 @@ package's own metadata. The table below summarises it; if the two disagree,
 | Component | Version | Licence | Purpose |
 |---|---|---|---|
 | Python | 3.12.6 | PSF-2.0 | Interpreter |
-| PySide6 / Qt | 6.11.2 | **LGPL-3.0** | Window, controls, OpenGL surface |
+| PySide6 / Qt | 6.12.0 | **LGPL-3.0** | Window, controls, OpenGL surface |
 | python-mpv | 1.0.8 | GPL-2.0-or-later or LGPL-2.1-or-later | Connects to libmpv at run time |
 | PyOpenGL | 3.1.10 | BSD-style, **compound** (see below) | OpenGL bindings |
 | SpoutGL | 0.1.1 | BSD-3-Clause | Spout texture sharing |
 | Spout2 (inside SpoutGL) | – | BSD-2-Clause | DirectX texture sharing |
-| yt-dlp | 2026.08.19 | Unlicense | Downloading clips |
+| yt-dlp | 2026.10.26 | Unlicense | Downloading clips |
 | bgutil-ytdlp-pot-provider (pip plugin only) | 2.0.0 | **GPL-3.0** | Requests PO tokens from the generator |
-| curl_cffi | 0.16.0 | MIT | Network requests for yt-dlp |
-| numpy | 2.5.2 | BSD-3-Clause and others | Dependency |
+| curl_cffi | 0.16.3 | MIT | Network requests for yt-dlp |
+| numpy | 2.5.4 | BSD-3-Clause and others | Dependency |
+
+The versions are those of the Windows 1.1 build. The macOS zip is built
+from its own environment, so some differ there; its `INVENTORY.md` has them.
 
 yt-dlp's own dependencies are bundled as well: requests, urllib3, certifi,
 charset-normalizer, idna, mutagen, pycryptodomex, brotli, websockets, cffi,
@@ -47,22 +52,45 @@ pycparser and yt-dlp-ejs. `INVENTORY.md` gives each one's version and licence.
 Two are easy to overlook: **mutagen is GPL-2.0-or-later**, and **certifi is
 MPL-2.0**.
 
+## macOS (test version)
+
+The macOS zip holds `ChuuTubePoi.app`. PyInstaller puts the same Python
+components into it as into the Windows zip, without SpoutGL, and adds:
+
+| Component | Licence | Purpose |
+|---|---|---|
+| syphon-python | MIT | Syphon output |
+| Syphon framework (inside syphon-python) | BSD-2-Clause | Texture sharing between apps |
+| PyObjC (core, Cocoa, Metal, IOSurface) | MIT | Access to macOS from Python |
+
+libmpv, Node.js and the token generator are not in the app, as on Windows:
+the app's first start installs libmpv with Homebrew and downloads the other
+two. `setup.sh --licenses` fills `licenses/` and `INVENTORY.md` for the Mac
+app, the way `setup.ps1 -Licenses` does on Windows. Its inventory is the
+one that counts for the Mac zip.
+
 ## Components without a licence file
 
-Two packages declare a licence but ship no licence text.
+Some packages declare a licence, but their wheels carry no licence text or not
+the right one. `setup.ps1 -Licenses` and `setup.sh --licenses` download these
+texts from the projects themselves and save them as `licenses/<package>.txt`.
+`INVENTORY.md` marks them "(from the project)".
 
-**bgutil-ytdlp-pot-provider (GPL-3.0).** `licenses\bgutil-ytdlp-pot-provider.txt`
-contains the GPL-3.0 text. It is the same text as this project's `LICENSE`.
-Upstream copy:
-<https://github.com/Brainicism/bgutil-ytdlp-pot-provider/blob/master/LICENSE>.
+| Package | Wheel has | Text saved | Source |
+|---|---|---|---|
+| bgutil-ytdlp-pot-provider | no text | GPL-3.0, the same text as this project's `LICENSE` | <https://github.com/Brainicism/bgutil-ytdlp-pot-provider/blob/master/LICENSE> |
+| PyOpenGL | no text | `license.txt` from the project (see below) | <https://github.com/mcfletch/pyopengl/blob/master/license.txt> |
+| PySide6, shiboken6 and the other PySide6 packages | Windows: only the Qt commercial notice. macOS: no text | LGPL-3.0, from Qt for Python | <https://github.com/qtproject/pyside-pyside-setup/blob/dev/LICENSES/LGPL-3.0-only.txt> |
+| pyobjc-core, pyobjc-framework-IOSurface, pyobjc-framework-Metal (macOS only) | no text | MIT, from PyObjC | <https://github.com/ronaldoussoren/pyobjc> |
 
 **PyOpenGL.** Its metadata says BSD-3-Clause, but upstream's `license.txt` is a
 compound document: the PyOpenGL licence (BSD-style) plus the licences of
 components inside the package – Pyglet, GLE (IBM), FreeGLUT (MIT/X), Togl, an
 OS-Mesa driver (MIT) and data from NVIDIA and others. All of them are
-permissive. Use the real text, not a summary:
+permissive.
 
-    curl -o licenses\PyOpenGL.txt https://raw.githubusercontent.com/mcfletch/pyopengl/master/license.txt
+LGPL-3.0 builds on the GPL-3.0. Its text is in `LICENSE`, which is in every
+zip.
 
 ## Licences with conditions
 
@@ -77,16 +105,22 @@ libmpv it is used with: GPL-2.0-or-later or LGPL-2.1-or-later.
 **The PO token plugin (GPL-3.0)** is bundled. The generator it talks to, also
 GPL-3.0, is downloaded by setup.
 
-ChuuTube2Spout's own code is GPL-3.0-or-later. See `LICENSE`.
+ChuuTubePoi's own code is GPL-3.0-or-later. See `LICENSE`.
 
 ## Before publishing a release
 
 1. Run `setup.ps1 -Licenses`. It regenerates `licenses\` and `INVENTORY.md`
    from the installed packages and downloads the other licence texts.
-2. If `INVENTORY.md` lists packages under "Shipped no licence text", get those
-   texts from the projects.
+2. If `INVENTORY.md` lists packages under "Shipped no licence text", add each
+   to the list of package texts in `setup.ps1` (on the Mac: `PACKAGE_LICENSES`
+   in `setup.sh`) with the URL of its licence text, and run step 1 again.
 3. Compare the table above with `INVENTORY.md` and correct any difference.
-4. Open the zip and check that it contains no `mpv-2.dll`, `deno.exe`,
-   `bgutil-pot.exe` or `bgutil-server\`.
+4. Open the zip and check that it contains no `mpv-2.dll`, `node\`,
+   `deno.exe`, `bgutil-pot.exe` or `bgutil-server\`.
 5. `build.ps1` only warns about an empty `licenses\` folder, so that test builds
    work. This list is what makes sure a published zip is complete.
+
+For the macOS zip, the same on the Mac that builds it: `bash setup.sh
+--licenses`, then steps 2 and 3 with its `licenses/INVENTORY.md`, then
+`build-mac.sh`. It refuses to put libmpv, `node` or `bgutil-server` into
+the app, and warns when the zip has no licence texts.

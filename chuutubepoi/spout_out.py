@@ -8,6 +8,9 @@ measure.
 
 On non-Windows (or if SpoutGL is missing) every call becomes a no-op so the rest
 of the app still runs, which is what makes the thing testable off-Windows.
+
+On macOS the app sends Syphon instead (syphon_out.py, since 1.1).
+create_output() at the bottom picks one; both have the same interface.
 """
 
 from __future__ import annotations
@@ -88,6 +91,8 @@ class SpoutOutput:
     Resolume, which is where a VJ already does it.
     """
 
+    kind = "Spout"
+
     def __init__(self, name_a: str = SENDER_A, name_b: str = SENDER_B) -> None:
         self.players = [Sender(name_a), Sender(name_b)]
 
@@ -117,3 +122,20 @@ class SpoutOutput:
     def shutdown(self) -> None:
         for s in self.players:
             s.release()
+
+
+def output_kind(platform: str | None = None) -> str:
+    """"Syphon" on macOS, "Spout" everywhere else."""
+    return "Syphon" if (platform or sys.platform) == "darwin" else "Spout"
+
+
+def create_output(platform: str | None = None):
+    """The sender pair for this platform: Syphon on macOS, Spout elsewhere.
+
+    Imported here, not at the top: syphon-python pulls in PyObjC, which
+    exists only on a Mac.
+    """
+    if output_kind(platform) == "Syphon":
+        from .syphon_out import SyphonOutput
+        return SyphonOutput()
+    return SpoutOutput()

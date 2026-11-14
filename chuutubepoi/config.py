@@ -8,8 +8,8 @@ editing source.
 
 Set them in run.bat, or in a shell before launching:
 
-    set CHUUTUBE2SPOUT_HWDEC=no
-    set CHUUTUBE2SPOUT_PREVIEW_FLIP=0
+    set CHUUTUBEPOI_HWDEC=no
+    set CHUUTUBEPOI_PREVIEW_FLIP=0
 """
 
 from __future__ import annotations
@@ -20,17 +20,20 @@ from pathlib import Path
 
 from .bootstrap import project_root
 
-SETTINGS_FILES = ("settings.txt", "chuutube2spout.conf", "yt2spout.conf")
+# settings.txt, or a file left from one of the app's earlier names.
+SETTINGS_FILES = ("settings.txt", "chuutube2" + "spout.conf", "yt2spout.conf")
 
-# Settings are looked up as CHUUTUBE2SPOUT_<KEY>. The old YT2SPOUT_ prefix is
-# still accepted, so an existing environment or a copied run.bat keeps working;
+# Settings are looked up as CHUUTUBEPOI_<KEY>. The prefixes of the app's two
+# earlier names (ChuuTube2Spout until 1.1, yt2spout before that) are still
+# accepted, so an existing environment or a copied run.bat keeps working;
 # settings.txt uses bare keys and was never affected either way.
 #
-# The literal below is deliberately NOT the new name. A blanket rename across
-# the tree once rewrote it to match ENV_PREFIX, which left the fallback pointing
-# at itself and silently doing nothing - the tests below exist because of that.
-ENV_PREFIX = "CHUUTUBE2SPOUT_"
-LEGACY_PREFIX = "YT2" + "SPOUT_"
+# The literals below are deliberately NOT written as one word. A blanket
+# rename across the tree once rewrote the old prefix to match ENV_PREFIX,
+# which left the fallback pointing at itself and silently doing nothing - the
+# tests exist because of that. Newest first: it wins over the older one.
+ENV_PREFIX = "CHUUTUBEPOI_"
+LEGACY_PREFIXES = ("CHUUTUBE2" + "SPOUT_", "YT2" + "SPOUT_")
 
 
 def _roots() -> list[Path]:
@@ -51,7 +54,7 @@ def _roots() -> list[Path]:
 
 
 def _settings_path() -> Path | None:
-    # CHUUTUBE2SPOUT_SETTINGS_FILE names another file, or "none" for no file.
+    # CHUUTUBEPOI_SETTINGS_FILE names another file, or "none" for no file.
     # The tests set "none": they must see the built-in defaults, not whatever
     # the developer's own settings.txt says (K's 0.9.9.40 build stopped on
     # eight tests because his settings.txt set a fixed 1920x1080 canvas).
@@ -110,7 +113,7 @@ def load_settings_file() -> str | None:
         if not key:
             continue
         key = key.upper()
-        if not key.startswith((ENV_PREFIX, LEGACY_PREFIX)):
+        if not key.startswith((ENV_PREFIX,) + LEGACY_PREFIXES):
             key = ENV_PREFIX + key
         os.environ.setdefault(key, value)
     return str(path)
@@ -121,7 +124,7 @@ SETTINGS_FILE = load_settings_file()
 
 def _raw(key: str) -> str | None:
     """The value of one setting, or None. Current prefix wins over the old."""
-    for prefix in (ENV_PREFIX, LEGACY_PREFIX):
+    for prefix in (ENV_PREFIX,) + LEGACY_PREFIXES:
         value = os.environ.get(prefix + key)
         if value is not None:
             return value
@@ -164,6 +167,24 @@ def _num(key: str, default: str) -> str:
 MPV_FLIP_Y = _flag("MPV_FLIP_Y", False)
 SPOUT_INVERT = _flag("SPOUT_INVERT", False)
 PREVIEW_FLIP = _flag("PREVIEW_FLIP", True)
+
+# Syphon (macOS) is OpenGL and expects row 0 at the BOTTOM - the opposite of
+# what mpv writes for Spout. So the Syphon server is told the texture is
+# flipped. Separate from SPOUT_INVERT for the same reason as above. If the
+# picture arrives upside down in Resolume on a Mac, set SYPHON_FLIP=0.
+SYPHON_FLIP = _flag("SYPHON_FLIP", True)
+
+# How the frame gets into Syphon (macOS).
+#   metal   (default) we copy our texture into a shared IOSurface ourselves
+#           and Syphon's Metal server publishes it.
+#   opengl  Syphon's OpenGL server draws our texture into its surface.
+# K, 1.0.8: with opengl the 4:3 bars reached every receiver black - a second
+# process read alpha 255 where our texture holds 0 - while Syphon's Metal
+# server kept them transparent in Resolume. opengl stays as the fallback, and
+# is used by itself if the Metal path cannot start.
+SYPHON_SERVER = _text("SYPHON_SERVER", "metal").lower()
+if SYPHON_SERVER not in ("metal", "opengl"):
+    SYPHON_SERVER = "metal"
 
 # --- Decoding ----------------------------------------------------------------
 # 'auto-safe' only enables hardware decoders mpv considers reliable. If video
@@ -251,11 +272,12 @@ YTDLP_VERBOSE = _flag("YTDLP_VERBOSE", True)
 # Verbose logging from the PO token server.
 POT_VERBOSE = _flag("POT_VERBOSE", True)
 
-# Prefer the standalone token server over the per-request deno script.
+# Prefer the token server over the per-request script.
 #
-# Both mint the same PO token. Script mode spawns deno once per token, which
-# the timing line reports as about 1.3s of every cold load; the server is
-# already running, so the same token costs an HTTP round trip on loopback.
+# Both mint the same PO token. Script mode spawns Node once per token, which
+# the timing line reported as about 1.3s of every cold load (measured with
+# deno, before 1.1); the server is already running, so the same token costs an
+# HTTP round trip on loopback.
 # Script mode stays as the fallback - it needs no separate executable, and the
 # server is refused outright when its version does not match the plugin's.
 TOKEN_SERVER = _flag("TOKEN_SERVER", True)
@@ -291,6 +313,12 @@ COOKIES_FROM_BROWSER = (_raw("COOKIES_FROM_BROWSER") or "").strip()
 # and each fetch skips re-parsing a few thousand cookies. Firefox-family only;
 # Chrome-family stores are encrypted, and fall back to yt-dlp doing the work.
 COOKIE_EXPORT = _flag("COOKIE_EXPORT", True)
+
+# At start, check once that the browser above is signed in to YouTube, and
+# say so in a message box if it is not (1.0.5). YouTube refuses or limits most
+# clips without a login. COOKIE_WARNING=0 turns the message off, for anyone who
+# runs without cookies on purpose.
+COOKIE_WARNING = _flag("COOKIE_WARNING", True)
 
 # Fetch the audio track at all. Off by default: this is a VJ tool feeding
 # Resolume, the sound almost always comes from somewhere else, and skipping it
@@ -425,8 +453,21 @@ CODEC_PREFERENCE = [c.strip().lower() for c in _num(
 # yt2spout-A/B needs re-pointing once; set these back to the old names if you
 # would rather not. (There was a third, SENDER_PROGRAM, until 0.9.9.20; a
 # leftover line for it in settings.txt is simply not read.)
-SENDER_A = _text("SENDER_A", "ChuuTube2Spout-A")
-SENDER_B = _text("SENDER_B", "ChuuTube2Spout-B")
+#
+# Renamed again with the app at 1.1 (K: "ChuuTube2Spout doesn't really work"
+# once it also sends Syphon): ChuuTubePoi-A/B, the same on Windows and macOS.
+# A Resolume composition made with 1.0 points at the old names; to keep it
+# working unchanged, set SENDER_A / SENDER_B to OLD_SENDER_NAMES.
+OLD_SENDER_NAMES = ("ChuuTube2" + "Spout-A", "ChuuTube2" + "Spout-B")
+
+
+def default_sender_names(platform: str | None = None) -> tuple[str, str]:
+    """The two source names. `platform` no longer matters: one name for both."""
+    return "ChuuTubePoi-A", "ChuuTubePoi-B"
+
+
+SENDER_A = _text("SENDER_A", default_sender_names()[0])
+SENDER_B = _text("SENDER_B", default_sender_names()[1])
 
 # Ceiling on any texture we allocate, and therefore on the canvas below. Up
 # here rather than with the other odds and ends because canvas() clamps

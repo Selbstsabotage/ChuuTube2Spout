@@ -83,7 +83,7 @@ class _Entry:
 
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "ChuuTube2Spout"
+    server_version = "ChuuTubePoi"
 
     def log_message(self, *args) -> None:  # noqa: D102 - silence the console
         pass
@@ -344,7 +344,7 @@ class HeaderProxy:
             self._server = _Server(("127.0.0.1", 0), _Handler)
             self._thread = threading.Thread(
                 target=self._server.serve_forever, kwargs={"poll_interval": 0.2},
-                name="chuutube2spout-proxy", daemon=True)
+                name="chuutubepoi-proxy", daemon=True)
             self._thread.start()
 
     @property

@@ -11,7 +11,13 @@ build:
 powershell -ExecutionPolicy Bypass -File setup.ps1 -Licenses
 ```
 
+For the macOS app, on the Mac that builds it:
+
+```
+bash setup.sh --licenses
+```
+
 This fills the folder and regenerates `INVENTORY.md` from each installed
-package's own metadata. `build.ps1` only warns if the folder is empty, so that
+package's own metadata. `build.ps1` and `build-mac.sh` only warn if the folder is empty, so that
 test builds work. The release checklist in RELEASING.md makes sure a published
 zip has the texts.

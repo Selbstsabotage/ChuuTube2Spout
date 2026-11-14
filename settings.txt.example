@@ -1,4 +1,4 @@
-# ChuuTube2Spout settings
+# ChuuTubePoi settings
 #
 # A line that starts with # is off. Three lines are on: the output size under
 # "Most used". Every other setting is at its default.
@@ -37,10 +37,13 @@ SENDER_HEIGHT=1080
 SENDER_BACKGROUND=transparent
 
 # --- Signing in to YouTube ---
-# Use your YouTube login from a browser. Needed for age-restricted videos and
-# helps when YouTube blocks downloads. Default: off.
+# Use your YouTube login from a browser. Needed for most clips: without it
+# YouTube refuses or limits most downloads. The app checks at start that the
+# browser is signed in, and says so if not. Default: off.
 #   waterfox, librewolf, floorp, zen, firefox   can stay open
 #   chrome, edge, brave, vivaldi, opera         close the browser first
+#   safari                                      macOS; Terminal needs Full
+#                                               Disk Access
 #   firefox:C:\path\to\profile                  a specific profile
 #COOKIES_FROM_BROWSER=firefox
 
@@ -76,11 +79,13 @@ SENDER_BACKGROUND=transparent
 #CACHE_MAX_AGE_H=72
 
 
-# === Spout output =============================================================
+# === Spout output (Syphon on macOS) ===========================================
 
-# Sender names in Resolume. Default: ChuuTube2Spout-A and ChuuTube2Spout-B.
-#SENDER_A=yt2spout-A
-#SENDER_B=yt2spout-B
+# Sender names in Resolume. Default: ChuuTubePoi-A and ChuuTubePoi-B.
+# Until version 1.0 they were ChuuTube2Spout-A and -B. To keep a composition
+# from then working without changing it, remove the # from these two lines:
+#SENDER_A=ChuuTube2Spout-A
+#SENDER_B=ChuuTube2Spout-B
 
 # The fixed output size and the colour of its bars are under "Most used".
 #
@@ -118,6 +123,12 @@ SENDER_BACKGROUND=transparent
 # Picture upside down?
 #PREVIEW_FLIP=0     # in the preview (default 1)
 #SPOUT_INVERT=1     # in Resolume (default 0)
+#SYPHON_FLIP=0      # in Resolume on macOS (default 1)
+
+# macOS: how frames get into Syphon. metal (default) keeps the bars of a 4:3
+# clip transparent. opengl is the older way; try it only if a receiver shows
+# nothing with metal.
+#SYPHON_SERVER=opengl
 
 
 # === Clip cache ===============================================================
@@ -230,6 +241,10 @@ SENDER_BACKGROUND=transparent
 # 0: let yt-dlp read the browser directly. Slower, and the browser must be
 # closed. Default: 1.
 #COOKIE_EXPORT=0
+
+# 0: no message at start when the browser is not signed in to YouTube.
+# Default: 1.
+#COOKIE_WARNING=0
 
 # Minutes before the cookies are read from the browser again. Default: 60.
 #COOKIE_MAX_AGE_MIN=30

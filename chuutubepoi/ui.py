@@ -3,17 +3,20 @@
 
 from __future__ import annotations
 
+import re
 import sys
 
-from PySide6.QtCore import (QElapsedTimer, QSettings, Qt, QTimer, Signal, Slot)
-from PySide6.QtGui import QColor, QKeySequence, QPainter, QShortcut
+from PySide6.QtCore import (QElapsedTimer, QSettings, Qt, QTimer, QUrl, Signal,
+                            Slot)
+from PySide6.QtGui import (QColor, QDesktopServices, QKeySequence, QPainter,
+                           QShortcut)
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPushButton, QSizePolicy, QSlider, QStyle,
     QStyleOptionSlider, QVBoxLayout, QWidget,
 )
 
-from . import APP_NAME, __version__
+from . import APP_NAME, LEGACY_APP_NAMES, __version__
 from . import cookies as cookie_store
 from .player import Player
 
@@ -27,7 +30,7 @@ from .config import (CACHE_DIR, CACHE_MAX_AGE_H, CACHE_MAX_GB,
                      canvas, output_description)
 from .modalloop import ModalTicker
 from .quality import DEFAULT_HEIGHT, PRESETS
-from .spout_out import SpoutOutput
+from .spout_out import create_output
 from .surface import PreviewSurface
 from .theme import ACCENT_DIM, LINE, STYLESHEET
 
@@ -63,6 +66,92 @@ def fmt_time(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
+def settings_path() -> Path:
+    """The settings.txt in use, or where it would be.
+
+    Named in full wherever a message tells someone to edit it (K, 1.1): in
+    the Mac app it is hidden in ~/Library, and "settings.txt" alone sent the
+    tester looking next to the app.
+    """
+    from .bootstrap import project_root
+    from .config import SETTINGS_FILE
+    return Path(SETTINGS_FILE) if SETTINGS_FILE else project_root() / "settings.txt"
+
+
+def open_folder(folder: Path) -> bool:
+    """Show a folder in the Finder or the Explorer."""
+    return bool(QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder))))
+
+
+SETTINGS_BUTTON = "Open settings folder"
+PRIVACY_BUTTON = "Open Full Disk Access"
+# System Settings, at Privacy & Security > Full Disk Access.
+FULL_DISK_ACCESS_URL = ("x-apple.systempreferences:"
+                        "com.apple.preference.security?Privacy_AllFiles")
+
+
+def mac_app_path() -> Path | None:
+    """ChuuTubePoi.app, when running as the Mac app: what to choose after +."""
+    from .bootstrap import is_mac_app
+    if not is_mac_app():
+        return None
+    return Path(sys.executable).resolve().parents[2]
+
+
+def add_settings_button(box) -> None:
+    """A button on a message box that shows the folder holding settings.txt.
+
+    The box closes when it is pressed, as with any of its buttons.
+    """
+    button = box.addButton(SETTINGS_BUTTON, QMessageBox.ActionRole)
+    folder = settings_path().parent
+    button.clicked.connect(lambda: open_folder(folder))
+
+
+_DOMAIN = re.compile(r"^(?:[\w-]+\.)+[a-z]{2,}(?:[/:?#]|$)", re.I)
+
+
+def worth_fetching(text: str) -> bool:
+    """Is this worth fetching ahead, before anyone presses Load?
+
+    A link (anything with ://, or a bare domain), or a file that is there.
+    Not a stray key: "1", "2" and "f" typed over a link each started a
+    yt-dlp run (tester, 1.1). Load itself still tries anything.
+    """
+    text = (text or "").strip()
+    if not text:
+        return False
+    if "://" in text or _DOMAIN.match(text):
+        return True
+    try:
+        return Path(text).expanduser().exists()
+    except (OSError, ValueError):
+        return False
+
+
+def keyboard_help(platform: str | None = None) -> str:
+    """The shortcuts, as the keyboard in front of the user labels them.
+
+    K, 1.1: on a Mac the help said Ctrl+1 where Qt wants ⌘1, and Home,
+    which a Mac keyboard does not have.
+    """
+    mac = (platform or sys.platform) == "darwin"
+    jump = "⌘1 / ⌘2" if mac else "Ctrl+1 / Ctrl+2"
+    start = "⌘← (or fn+←)" if mac else "Home"
+    return (
+        "The keys act on the highlighted slot. Pick it with 1 / 2, or by "
+        "using anything in a slot.<br>"
+        "1 / 2 - select slot A / B<br>"
+        "Space - play / pause<br>"
+        "M - audio on / off (one slot at a time)<br>"
+        "← / → - seek 5s &nbsp;&nbsp; Shift+←/→ - seek 60s<br>"
+        f"{start} - back to the start<br>"
+        f"{jump} - jump to a URL field<br>"
+        "Esc - leave a URL field, so the keys above work again, and undo "
+        "what was typed there (Enter loads and leaves)<br>"
+        "F - resize the window so both previews are exactly 16:9<br>")
+
+
 def log_line() -> str:
     """Where this run is being logged, for the help box. Empty if it is not.
 
@@ -74,8 +163,12 @@ def log_line() -> str:
     current = log_path()
     if current is None:
         return ""
-    return ("<b>Log</b><br>This session is being written to "
+    text = ("<b>Log</b><br>This session is being written to "
             f"<code>{current}</code>.<br>Attach it to a bug report.<br><br>")
+    # Both systems: where settings.txt is, with a button to open its folder.
+    text += (f"<b>Settings</b><br><code>{settings_path()}</code><br>"
+             f"{SETTINGS_BUTTON} shows it.<br><br>")
+    return text
 
 
 def restyle(widget: QWidget) -> None:
@@ -327,6 +420,10 @@ class UrlEdit(QLineEdit):
 
     def focusInEvent(self, event) -> None:
         super().focusInEvent(event)
+        # What Esc goes back to. Arriving selects everything, so the next key
+        # replaces the link: 1, 2 or F pressed for the shortcuts did (tester,
+        # 1.1, the log shows "1", "2" and "f" fetched as links).
+        self._entry_text = self.text()
         self.focused.emit()
         if self.text():
             QTimer.singleShot(0, self.selectAll)
@@ -338,6 +435,24 @@ class UrlEdit(QLineEdit):
         # the caret somewhere - so only re-select when arriving from elsewhere.
         if not already_focused and self.text():
             QTimer.singleShot(0, self.selectAll)
+
+    def keyPressEvent(self, event) -> None:
+        # Esc leaves the field. While it has the keyboard, 1, 2, Space and M
+        # are typed into it, so there was no way back to the shortcuts but
+        # the mouse (K, 1.1). What was typed since arriving is undone.
+        if event.key() == Qt.Key_Escape:
+            entry = getattr(self, "_entry_text", None)
+            if entry is not None and self.text() != entry:
+                self.setText(entry)
+            self.leave()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def leave(self) -> None:
+        """Give the keyboard back to the window's shortcuts."""
+        self.deselect()
+        self.clearFocus()
 
 
 class PlayerPanel(QFrame):
@@ -387,6 +502,8 @@ class PlayerPanel(QFrame):
         # the button minimums in theme.py: a hint alone gets squeezed.
         self.url_edit.setMinimumWidth(URL_MIN_WIDTH)
         self.url_edit.returnPressed.connect(self.load)
+        # Enter has done its job: the shortcuts work again straight away.
+        self.url_edit.returnPressed.connect(self.url_edit.leave)
         self.url_edit.textEdited.connect(self._on_url_edited)
 
         # Paste is what actually gets pressed when a clip changes, so it is the
@@ -542,7 +659,7 @@ class PlayerPanel(QFrame):
 
     def _prefetch_now(self) -> None:
         url = self.url_edit.text().strip()
-        if url:
+        if worth_fetching(url):
             self.player.prefetch(url)
 
     @Slot(str)
@@ -739,8 +856,20 @@ class PlayerPanel(QFrame):
 
 
 class MainWindow(QMainWindow):
+    # The start-up cookie check's answer, from its thread to this one.
+    cookieVerdict = Signal(bool, str)
+    # A Syphon sender left the Metal path (macOS): sender name, reason.
+    syphonFallback = Signal(str, str)
+
     def __init__(self) -> None:
         super().__init__()
+        self.cookieVerdict.connect(self._show_cookie_verdict)
+        self._cookie_box = None
+        # Queued: the sender reports from inside a frame, with the GL context
+        # current. The box opens after the frame, not in the middle of it.
+        self.syphonFallback.connect(self._show_syphon_fallback,
+                                    Qt.QueuedConnection)
+        self._fallback_box = None
         self.setWindowTitle(APP_NAME)
         self.setStyleSheet(STYLESHEET)
         self.settings = QSettings(APP_NAME, APP_NAME)
@@ -749,7 +878,10 @@ class MainWindow(QMainWindow):
         # opening chunk and refuses the rest.
         get_provider().start()
         self.players = [Player(name) for name in SLOTS]
-        self.spout = SpoutOutput()
+        # Spout on Windows, Syphon on macOS (since 1.1). Same interface either way.
+        self.spout = create_output()
+        if hasattr(self.spout, "set_fallback_handler"):
+            self.spout.set_fallback_handler(self.syphonFallback.emit)
         self.surface = PreviewSurface(self.players, self.spout)
         # Keeps the render loop - and so Spout - running while the title bar
         # is held. See modalloop.py.
@@ -806,6 +938,74 @@ class MainWindow(QMainWindow):
         if not self._fitted:
             self._fitted = True
             QTimer.singleShot(0, self._first_fit)
+            self._start_cookie_check()
+
+    def _start_cookie_check(self) -> None:
+        """Once per start: is the browser set for cookies signed in?
+
+        In a thread: reading a cookie store takes a moment, and on a Mac a
+        Chrome store asks the keychain first. The window and the render loop
+        must not wait for either.
+        """
+        from .config import COOKIE_WARNING, COOKIES_FROM_BROWSER
+        if not COOKIE_WARNING:
+            return
+        import threading
+
+        def run():
+            ok, problem = cookie_store.check(COOKIES_FROM_BROWSER)
+            self.cookieVerdict.emit(ok, problem)
+        threading.Thread(target=run, name="cookie-check", daemon=True).start()
+
+    @Slot(bool, str)
+    def _show_cookie_verdict(self, ok: bool, problem: str) -> None:
+        """Log the answer; if it is bad, say it once, without blocking."""
+        if ok:
+            print("[chuutube] cookies: signed in to YouTube", file=sys.stderr)
+            return
+        print(f"[chuutube] cookies: {problem}", file=sys.stderr)
+        # Not exec(): a modal loop here would hold up nothing visible, but
+        # show() keeps the start exactly as it was, with a note on top.
+        from .cookies import MAC_PRIVACY_START
+        privacy = problem.startswith(MAC_PRIVACY_START)
+        text = problem
+        if privacy and mac_app_path() is not None:
+            # The file dialog behind + needs to be pointed at the app.
+            text += f"\n\nThe app is here:\n{mac_app_path()}"
+        text += ("\n\nTo stop this message: COOKIE_WARNING=0 in settings.txt."
+                 f"\n\nsettings.txt is here:\n{settings_path()}")
+        box = QMessageBox(QMessageBox.Warning, f"{APP_NAME} - YouTube login",
+                          text, QMessageBox.Ok, self)
+        if privacy:
+            button = box.addButton(PRIVACY_BUTTON, QMessageBox.ActionRole)
+            button.clicked.connect(
+                lambda: QDesktopServices.openUrl(QUrl(FULL_DISK_ACCESS_URL)))
+        add_settings_button(box)
+        box.setModal(False)
+        box.show()
+        self._cookie_box = box
+
+    @Slot(str, str)
+    def _show_syphon_fallback(self, name: str, reason: str) -> None:
+        """Say once per start that transparency is lost; do not block.
+
+        Both senders fall back for the same cause, so the second report
+        would only repeat the first.
+        """
+        if self._fallback_box is not None:
+            return
+        box = QMessageBox(
+            QMessageBox.Warning, f"{APP_NAME} - Syphon",
+            "Transparency will not work in this session.\n\n"
+            "The Metal output could not start, so the app sends through "
+            "Syphon's OpenGL output instead. There, the bars of a 4:3 clip "
+            "arrive black instead of transparent.\n\n"
+            f"Reason ({name}): {reason}\n\n"
+            "Please send the log file from the logs folder to the developer.",
+            QMessageBox.Ok, self)
+        box.setModal(False)
+        box.show()
+        self._fallback_box = box
 
     def _first_fit(self) -> None:
         """The startup fit, which is also where WINDOW_SCALE is applied."""
@@ -1057,7 +1257,7 @@ class MainWindow(QMainWindow):
         than of any clip - it is what Resolume will show whatever you load, and
         the only place in the window that says so.
         """
-        text = "Spout out:  " + "   ".join(self.spout.names())
+        text = f"{self.spout.kind} out:  " + "   ".join(self.spout.names())
         text += f"   @ {output_description()}"
         width, height = canvas()
         if width and height:
@@ -1112,24 +1312,20 @@ class MainWindow(QMainWindow):
         add("Shift+Left", lambda: self.players[self.selected_index].seek_relative(-60))
         add("Shift+Right", lambda: self.players[self.selected_index].seek_relative(60))
         add("Home", lambda: self.panels[self.selected_index].jump_to_start())
+        if sys.platform == "darwin":
+            # Mac keyboards have no Home key (fn+← sends it). Qt reads Ctrl
+            # as ⌘ on a Mac, so this is ⌘←, the Mac's own "to the start".
+            add("Ctrl+Left", lambda: self.panels[self.selected_index].jump_to_start())
+        # Qt reads Ctrl as ⌘ on a Mac: this is ⌘1 / ⌘2 there.
         add("Ctrl+1", lambda: self.panels[0].url_edit.setFocus())
         add("Ctrl+2", lambda: self.panels[1].url_edit.setFocus())
         add("F", self.fit_preview)
 
     def _show_help(self) -> None:
-        QMessageBox.information(
-            self, APP_NAME,
-            "<b>Keyboard</b><br>"
-            "The keys act on the highlighted slot. Pick it with 1 / 2, or by "
-            "using anything in a slot.<br>"
-            "1 / 2 - select slot A / B<br>"
-            "Space - play / pause<br>"
-            "M - audio on / off (one slot at a time)<br>"
-            "← / → - seek 5s &nbsp;&nbsp; Shift+←/→ - seek 60s<br>"
-            "Home - back to the start<br>"
-            "Ctrl+1 / Ctrl+2 - jump to a URL field<br>"
-            "F - resize the window so both previews are exactly 16:9<br><br>"
-            "<b>Spout</b><br>"
+        box = QMessageBox(
+            QMessageBox.Information, APP_NAME,
+            "<b>Keyboard</b><br>" + keyboard_help() + "<br>"
+            f"<b>{self.spout.kind}</b><br>"
             f"'{SENDER_A}' and '{SENDER_B}' are always live: switch and "
             "crossfade between them inside Resolume.<br><br>"
             + log_line() +
@@ -1137,7 +1333,10 @@ class MainWindow(QMainWindow):
             "that is what the second slot is for."
             f"<br><br><b>{APP_NAME} {__version__}</b> - free software under the "
             "GNU GPL v3 or later, with ABSOLUTELY NO WARRANTY. "
-            "See the LICENSE file.")
+            "See the LICENSE file.",
+            QMessageBox.Ok, self)
+        add_settings_button(box)
+        box.exec()
 
     # -- settings -------------------------------------------------------------
 
@@ -1173,26 +1372,29 @@ class MainWindow(QMainWindow):
         return restored
 
     def _migrate_settings(self) -> None:
-        """Carry the old yt2spout window state over to the new name, once.
+        """Carry the window state over from the app's earlier name, once.
 
-        QSettings keys are namespaced by application name, so the rename would
-        otherwise silently reset the window size and both URL fields.
+        QSettings keys are namespaced by application name, so a rename would
+        otherwise silently reset the window size and both URL fields. The
+        newest earlier name that left anything wins.
         """
         if self.settings.value("geometry") is not None:
             return
-        try:
-            legacy = QSettings("yt2spout", "yt2spout")
-            keys = list(legacy.allKeys())
-        except Exception:
+        for name in LEGACY_APP_NAMES:
+            try:
+                legacy = QSettings(name, name)
+                keys = list(legacy.allKeys())
+            except Exception:
+                continue
+            if not keys:
+                continue
+            for key in keys:
+                self.settings.setValue(key, legacy.value(key))
+            try:
+                self.settings.sync()
+            except Exception:
+                pass
             return
-        if not keys:
-            return
-        for key in keys:
-            self.settings.setValue(key, legacy.value(key))
-        try:
-            self.settings.sync()
-        except Exception:
-            pass
 
     def _save_settings(self) -> None:
         self.settings.setValue("geometry", self.saveGeometry())

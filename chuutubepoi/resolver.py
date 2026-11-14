@@ -380,10 +380,10 @@ def _summarise(attempts: list[str]) -> str:
     if deep and len(deep) == len(attempts):
         return ("every client serves the opening chunk then refuses the rest. "
                 "That is YouTube's PO-token gate - sign in with "
-                "CHUUTUBE2SPOUT_COOKIES_FROM_BROWSER=firefox, or see the README.")
+                "CHUUTUBEPOI_COOKIES_FROM_BROWSER=firefox, or see the README.")
     forbidden = [a for a in attempts if "403" in a]
     if len(forbidden) == len(attempts):
         return ("every client refused (403). YouTube is blocking this IP for "
                 "media, not your setup - try without a VPN, or set "
-                "CHUUTUBE2SPOUT_COOKIES_FROM_BROWSER to sign in.")
+                "CHUUTUBEPOI_COOKIES_FROM_BROWSER to sign in.")
     return "; ".join(attempts[:3])

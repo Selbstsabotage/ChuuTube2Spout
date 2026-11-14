@@ -149,8 +149,12 @@ class Perf:
         # stutters.
         per = max(1, self.frames)
         last_call = self._last_call
+        # The output stage keeps its internal name; the line says which output
+        # it is ("syphon" on a Mac - the tester's log said "spout" there).
+        from .spout_out import output_kind
+        shown = {"spout": output_kind().lower()}
         stages = "  ".join(
-            f"{name} {self.totals[name] / per * 1000:.2f}ms"
+            f"{shown.get(name, name)} {self.totals[name] / per * 1000:.2f}ms"
             for name in self.STAGES)
         share = sum(self.totals.values()) / elapsed * 100
         print(f"[chuutube] perf {elapsed:.1f}s: {self.ticks} ticks, "

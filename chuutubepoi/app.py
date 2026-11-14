@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import sys
 
-from .bootstrap import (YTDLP_FLAG, mpv_import_error_help,
+from .bootstrap import (YTDLP_FLAG, apply_gl_profile, mpv_import_error_help,
                         prepare_native_paths)
 
 
@@ -80,7 +80,8 @@ def main(argv: list[str] | None = None) -> int:
     # the console tools below (they are run from a .bat, with a console right
     # there, and a run of check.bat would age out the GUI log people want).
     if not any(a in argv for a in ("--doctor", "--check", "--version",
-                                   "--clear-cache")):
+                                   "--clear-cache", "--syphon-check",
+                                   "--syphon-pattern")):
         try:
             from .logfile import start as start_logging
             start_logging()
@@ -104,6 +105,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if "--clear-cache" in argv:
         return clear_cache()
+    if "--syphon-pattern" in argv:
+        from .syphoncheck import pattern as run_syphon_pattern
+        return run_syphon_pattern()
+    if "--syphon-check" in argv:
+        from .syphoncheck import run as run_syphon_check
+        return run_syphon_check(argv)
 
     # Must happen before anything imports the `mpv` module.
     prepare_native_paths()
@@ -136,8 +143,7 @@ def main(argv: list[str] | None = None) -> int:
     QApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
 
     fmt = QSurfaceFormat()
-    fmt.setVersion(3, 3)
-    fmt.setProfile(QSurfaceFormat.CompatibilityProfile)
+    apply_gl_profile(fmt)
     fmt.setRenderableType(QSurfaceFormat.OpenGL)
     fmt.setDepthBufferSize(0)
     fmt.setStencilBufferSize(0)
@@ -158,6 +164,13 @@ def main(argv: list[str] | None = None) -> int:
     app = QApplication(argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(APP_NAME)
+    # Every window, the first-run setup included. The exe and the Mac app
+    # carry the same picture as their file icon (build.ps1, build-mac.sh).
+    from .bootstrap import icon_file
+    icon = icon_file()
+    if icon is not None:
+        from PySide6.QtGui import QIcon
+        app.setWindowIcon(QIcon(str(icon)))
 
     # Before anything expensive: a mode that cannot work should say so rather
     # than extract, play nothing, and leave the reason in a log nobody is
@@ -170,13 +183,25 @@ def main(argv: list[str] | None = None) -> int:
     # In the log, because "why is my 4K clip soft" and "why is there a black
     # bar" both have their answer here and neither is visible in the window.
     from .config import SENDER_FIT, canvas, output_description
+    from .spout_out import output_kind
+    kind = output_kind()
     width, height = canvas()
     if width and height:
-        print(f"[chuutube] Spout canvas: {width}x{height} ({SENDER_FIT})",
+        print(f"[chuutube] {kind} canvas: {width}x{height} ({SENDER_FIT})",
               file=sys.stderr)
     else:
-        print(f"[chuutube] Spout output: each clip at its own size "
+        print(f"[chuutube] {kind} output: each clip at its own size "
               f"({output_description()})", file=sys.stderr)
+
+    # The macOS app: Node.js and the token generator come from setup.sh, run
+    # from inside the bundle. Asked before the window, as on Windows when
+    # libmpv is missing - but here libmpv usually is there (Homebrew), so
+    # that trigger alone would never fire.
+    offered = False
+    from . import firstrun
+    if firstrun.should_offer_at_start():
+        firstrun.offer_runtime_install(None)
+        offered = True
 
     try:
         from .ui import MainWindow
@@ -186,7 +211,8 @@ def main(argv: list[str] | None = None) -> int:
         # find a .bat before the thing they downloaded will open is a poor
         # first impression, and they already have the window open.
         from .firstrun import offer_runtime_install
-        if not offer_runtime_install(exc):
+        # Not twice in one start: setup.sh already ran (and tried Homebrew).
+        if offered or not offer_runtime_install(exc):
             QMessageBox.critical(None, f"{APP_NAME} - missing dependency",
                                  mpv_import_error_help(exc))
             return 2
@@ -200,7 +226,32 @@ def main(argv: list[str] | None = None) -> int:
 
     window = MainWindow()
     window.show()
-    return app.exec()
+    # macOS slows the timers of an app in the background, and with Resolume
+    # in front that is us: Syphon would stutter. Held for the whole session.
+    from .macos import keep_awake
+    _activity = keep_awake()  # noqa: F841 - must stay referenced until exit
+    return leave(app.exec())
+
+
+def leave(code: int) -> int:
+    """End the process once the window has closed and cleaned up after itself.
+
+    Without PySide's own cleanup at interpreter exit: it deletes every Qt
+    object Python still holds, in no particular order, and one wrong guess
+    about who owns what is a crash on quitting (tester, 1.1, the Mac app).
+    By now closeEvent has stopped the players, the token server and the
+    cookie jar; what is left is to flush the log and remove the jar again,
+    in case the window never got to close.
+    """
+    import os
+    from . import cookies, logfile
+    try:
+        cookies.cleanup()
+    except Exception:
+        pass
+    logfile.flush_all()
+    os._exit(int(code or 0))
+    return int(code or 0)    # reached only when a test stands in for _exit
 
 
 if __name__ == "__main__":
